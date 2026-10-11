@@ -4,12 +4,17 @@
 #
 #   cp .env.example .env            # fill in credentials
 #   edit config/*.yaml              # what to crawl
-#   docker compose -f docker-compose.example.yml up -d --build
+#   docker compose -f docker-compose.example.yml up -d
+#
+# Images are pulled from ghcr.io/silcrats; set PELICAN_VERSION in .env to
+# pin a release (default: latest). Add --build to build from this checkout
+# instead.
 #
 # OpenSearch here runs with security disabled -- fine on a private network
 # for trying things out, not for production.
 
 x-crawler: &crawler
+  image: ghcr.io/silcrats/pelican:${PELICAN_VERSION:-latest}
   build: .
   env_file: .env
   networks: [search]
@@ -89,6 +94,7 @@ services:
   # Exports mailbox Full Access holders for crawl-exchange. Needs a
   # certificate on the Entra app: put it at secrets/exo.pfx.
   exo-permissions:
+    image: ghcr.io/silcrats/pelican-exo-permissions:${PELICAN_VERSION:-latest}
     build: ./exo-permissions
     container_name: pelican-exo-permissions
     env_file: .env
@@ -102,6 +108,7 @@ services:
     networks: [search]
 
   status:
+    image: ghcr.io/silcrats/pelican-status:${PELICAN_VERSION:-latest}
     build: ./status-page
     container_name: pelican-status
     env_file: .env

@@ -35,8 +35,12 @@ Requires Docker with Compose.
 ```sh
 cp .env.example .env                      # credentials
 $EDITOR config/shares.yaml                # and/or exchange.yaml, sharepoint.yaml
-docker compose -f docker-compose.example.yml up -d --build
+docker compose -f docker-compose.example.yml up -d
 ```
+
+This pulls the published images from `ghcr.io/silcrats` (`pelican`,
+`pelican-status`, `pelican-exo-permissions`). Set `PELICAN_VERSION` in `.env`
+to pin a release, or add `--build` to build from your checkout instead.
 
 The example runs a single-node OpenSearch (security disabled), one container
 per job scheduled by [ofelia](https://github.com/mcuadros/ofelia), and the
