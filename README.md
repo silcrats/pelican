@@ -45,7 +45,8 @@ to pin a release, or add `--build` to build from your checkout instead.
 The example runs a single-node OpenSearch with its security plugin on (see
 [OpenSearch security](#opensearch-security)), one container per job
 scheduled by [ofelia](https://github.com/mcuadros/ofelia), and the status
-page on <http://localhost:8090>. Remove the services you don't need.
+page on <http://localhost:8090> (sign in as `pelican` with `STATUS_PASSWORD`).
+Remove the services you don't need.
 
 Each crawler is a one-shot process: it crawls once and exits. The image
 defaults to `crawl_smb.py`; choose another job with an entrypoint override.
@@ -85,6 +86,7 @@ that hold them (`user_env` / `pass_env` / `domain_env` for SMB,
 | `JOB_NAME`, `STATUS_DIR` | `primary`, `/status` | Status file name and location |
 | `SHARE_NAMES`, `MAILBOX_NAMES`, `SITE_NAMES` | all | Comma-separated subset for this container, to split work across containers |
 | `TZ` | UTC | Time zone for status timestamps |
+| `STATUS_PASSWORD`, `STATUS_USERNAME` | required, `pelican` | Status page sign-in. It won't start without a password of 12+ characters |
 
 Tuning (all optional): `BATCH_SIZE`, `SMB_WORKERS`, `GRAPH_WORKERS`,
 `SP_WORKERS`, `ACL_SYNC_WORKERS`, `ACL_RECHECK_HOURS`, `PDF_TIMEOUT_SECONDS`,

@@ -1,9 +1,11 @@
 import base64
 import glob
+import hmac
 import http.server
 import json
 import os
 import ssl
+import sys
 import threading
 import time
 import urllib.error
@@ -11,6 +13,12 @@ import urllib.request
 
 STATUS_DIR = os.environ.get("STATUS_DIR", "/status")
 PORT = int(os.environ.get("PORT", "8090"))
+
+# Browser sign-in for the page and its data. Required: the page shows share,
+# mailbox and site names, error messages and index sizes.
+STATUS_USERNAME = os.environ.get("STATUS_USERNAME") or "pelican"
+STATUS_PASSWORD = os.environ.get("STATUS_PASSWORD", "")
+MIN_PASSWORD_LENGTH = 12
 
 # --- OpenSearch storage view -------------------------------------------------
 OS_HOST = os.environ.get("OS_HOST", "http://opensearch:9200").rstrip("/")
@@ -541,7 +549,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _signed_in(self) -> bool:
+        scheme, _, encoded = (self.headers.get("Authorization") or "").partition(" ")
+        if scheme.lower() != "basic":
+            return False
+        try:
+            user, _, password = base64.b64decode(encoded, validate=True).decode("utf-8").partition(":")
+        except ValueError:
+            return False
+        # Compare both, always, so timing doesn't reveal which was wrong.
+        ok_user = hmac.compare_digest(user.encode(), STATUS_USERNAME.encode())
+        ok_password = hmac.compare_digest(password.encode(), STATUS_PASSWORD.encode())
+        return ok_user and ok_password
+
     def do_GET(self):
+        if not self._signed_in():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Pelican status", charset="UTF-8"')
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Sign-in required\n")
+            return
         if self.path.startswith("/status.json"):
             self._send_json({"jobs": _collect_jobs()})
         elif self.path.startswith("/storage.json"):
@@ -559,5 +587,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if len(STATUS_PASSWORD) < MIN_PASSWORD_LENGTH:
+        sys.exit(f"STATUS_PASSWORD must be set to at least {MIN_PASSWORD_LENGTH} characters "
+                 "(the status page's sign-in; user name STATUS_USERNAME, default 'pelican')")
     threading.Thread(target=_storage_loop, daemon=True).start()
     http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
