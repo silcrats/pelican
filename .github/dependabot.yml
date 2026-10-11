@@ -1,0 +1,23 @@
+# Weekly dependency checks. Minor and patch updates are grouped into one PR
+# per ecosystem; each major update gets its own PR. Python version moves
+# (3.13 -> 3.14 counts as "minor") are left manual.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      pip: { patterns: ["*"], update-types: [minor, patch] }
+
+  - package-ecosystem: docker
+    directories: [/, /status-page]
+    schedule: { interval: weekly }
+    ignore:
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      actions: { patterns: ["*"], update-types: [minor, patch] }

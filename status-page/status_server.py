@@ -112,26 +112,26 @@ function renderJob(data) {
   const cfg = data.config || {};
   let cfgHtml = '';
   if (cfg.smb_workers !== undefined) {
-    const exts = (cfg.exclude_extensions || []).join(', ') || 'none';
+    const exts = esc((cfg.exclude_extensions || []).join(', ') || 'none');
     cfgHtml =
-      `Workers: <b>${cfg.smb_workers}</b> &middot; ` +
+      `Workers: <b>${esc(cfg.smb_workers)}</b> &middot; ` +
       `Excluded extensions: <b>${exts}</b> &middot; ` +
-      `Excluded (no extension): <b>${cfg.exclude_no_extension}</b>`;
+      `Excluded (no extension): <b>${esc(cfg.exclude_no_extension)}</b>`;
   }
 
   const metaHtml =
-    `Status: <b class="status-${data.status}">${data.status}</b> &middot; ` +
-    `Started: ${data.started_at || '-'} &middot; ` +
-    `Finished: ${data.finished_at || '-'} &middot; ` +
-    `Total indexed: <b>${data.grand_total_indexed}</b> &middot; ` +
-    `Last updated: ${data.last_updated || '-'}`;
+    `Status: <b class="status-${esc(data.status)}">${esc(data.status)}</b> &middot; ` +
+    `Started: ${esc(data.started_at || '-')} &middot; ` +
+    `Finished: ${esc(data.finished_at || '-')} &middot; ` +
+    `Total indexed: <b>${esc(data.grand_total_indexed)}</b> &middot; ` +
+    `Last updated: ${esc(data.last_updated || '-')}`;
 
   const rows = Object.entries(data.shares || {}).map(([name, s]) => `
     <tr>
-      <td>${name}</td>
-      <td class="status-${s.status}">${s.status}${s.error ? ' - ' + s.error : ''}</td>
-      <td class="num">${s.discovered}</td><td class="num">${s.indexed}</td>
-      <td class="num">${s.skipped_excluded}</td><td class="num">${s.skipped_unchanged}</td>
+      <td>${esc(name)}</td>
+      <td class="status-${esc(s.status)}">${esc(s.status)}${s.error ? ' - ' + esc(s.error) : ''}</td>
+      <td class="num">${esc(s.discovered)}</td><td class="num">${esc(s.indexed)}</td>
+      <td class="num">${esc(s.skipped_excluded)}</td><td class="num">${esc(s.skipped_unchanged)}</td>
       <td class="num ${s.skipped_oversized ? 'timeout-count' : ''}">${s.skipped_oversized || 0}</td>
       <td class="num ${s.extraction_timeouts ? 'timeout-count' : ''}">${s.extraction_timeouts || 0}</td>
       <td class="num ${s.acl_docs_updated ? 'acl-count' : ''}" title="${s.acl_groups_changed || 0} director${s.acl_groups_changed === 1 ? 'y' : 'ies'} with a permission change this run">${s.acl_docs_updated || 0}</td>
@@ -140,7 +140,7 @@ function renderJob(data) {
   const div = document.createElement('div');
   div.className = 'job';
   div.innerHTML = `
-    <h2 class="c-${['smb', 'exchange', 'sharepoint', 'acl'].includes(data.job_type) ? data.job_type : 'smb'}">${data.job_name || 'unnamed job'}</h2>
+    <h2 class="c-${['smb', 'exchange', 'sharepoint', 'acl'].includes(data.job_type) ? data.job_type : 'smb'}">${esc(data.job_name || 'unnamed job')}</h2>
     <div class="config">${cfgHtml}</div>
     <div class="meta">${metaHtml}</div>
     <table class="crawl-table"><thead>

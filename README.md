@@ -89,6 +89,10 @@ Tuning (all optional): `BATCH_SIZE`, `SMB_WORKERS`, `GRAPH_WORKERS`,
 `SMB_LIST_TIMEOUT_SECONDS`, `SMB_FETCH_TIMEOUT_SECONDS`,
 `SMB_LIST_STALL_SECONDS`, `GRAPH_MAX_RETRIES`.
 
+The crawler and status images run as UID 10001, not root. Anything you
+mount (config, `secrets/`, state and status volumes) must be readable by that
+user, and the state and status volumes writable.
+
 ## Index contract
 
 Any search UI reading the index must agree with `config/pelican.yaml`:
@@ -121,6 +125,8 @@ pelican/                           shared core
   status.py, watchdog.py           progress reporting, hang protection
 config/                            example configuration
 search_index_mapping.json          index mapping
+requirements.in                    direct dependencies; requirements.txt is
+                                   the pinned, hashed lock (pip-compile)
 status-page/, exo-permissions/     separate images
 ```
 
