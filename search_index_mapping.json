@@ -1,0 +1,50 @@
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 0
+  },
+  "mappings": {
+    "properties": {
+      "url": { "type": "keyword" },
+      "share": { "type": "keyword" },
+      "host": { "type": "keyword" },
+      "acl_group": { "type": "keyword" },
+      "title": { "type": "text" },
+      "filename": {
+        "type": "text",
+        "fields": { "keyword": { "type": "keyword", "ignore_above": 512 } }
+      },
+      "content": { "type": "text" },
+      "role": { "type": "keyword" },
+      "filetype": { "type": "keyword" },
+      "mimetype": { "type": "keyword" },
+      "content_length": { "type": "long" },
+      "doc_bytes": { "type": "long" },
+      "timestamp": { "type": "date" },
+      "last_modified": { "type": "date" },
+      "email_from": {
+        "type": "text",
+        "fields": { "keyword": { "type": "keyword", "ignore_above": 512 } }
+      },
+      "email_to": {
+        "type": "text",
+        "fields": { "keyword": { "type": "keyword", "ignore_above": 512 } }
+      },
+      "email_cc": {
+        "type": "text",
+        "fields": { "keyword": { "type": "keyword", "ignore_above": 512 } }
+      },
+      "email_subject": { "type": "text" },
+      "email_attachments": {
+        "type": "text",
+        "fields": { "keyword": { "type": "keyword", "ignore_above": 512 } }
+      },
+      "email_message_id": { "type": "keyword" },
+      "image_camera_make": { "type": "keyword" },
+      "image_camera_model": { "type": "keyword" },
+      "image_gps_lat": { "type": "float" },
+      "image_gps_lon": { "type": "float" },
+      "image_location": { "type": "text", "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } } }
+    }
+  }
+}

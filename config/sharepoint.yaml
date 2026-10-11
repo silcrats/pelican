@@ -1,0 +1,157 @@
+# SharePoint Online sites for crawl_sharepoint.py. Example values -- replace
+# the `sites:` entries with your own.
+# Lives next to shares.yaml / exchange.yaml and follows the same conventions: secrets
+# come from environment variables, one entry per source, global defaults that a
+# single entry can override.
+#
+# Documents go into the SAME OpenSearch index as the SMB and Exchange crawls. The
+# site `name` below is written to the `source` shown in search (the `share` field),
+# so keep it distinct from names in shares.yaml and exchange.yaml
+# (e.g. "engineering_sp").
+#
+# PREREQUISITES (Entra ID / SharePoint):
+#   1. Same Entra app registration as the Exchange crawler (client id / secret in
+#      GRAPH_CLIENT_ID / GRAPH_SECRET).
+#   2. Add the Microsoft Graph *Application* permission Sites.Selected and grant
+#      admin consent. By itself it gives access to NO sites.
+#   3. Grant the app read access to each site listed below, one at a time. As a
+#      SharePoint/global admin, in Graph Explorer (https://aka.ms/ge) after
+#      consenting to Sites.FullControl.All for yourself:
+#        GET  https://graph.microsoft.com/v1.0/sites/<tenant>.sharepoint.com:/sites/<SiteName>
+#             -> copy the "id" from the result
+#        POST https://graph.microsoft.com/v1.0/sites/<that id>/permissions
+#             {"roles": ["read"],
+#              "grantedToIdentities": [{"application": {"id": "<app client id>",
+#                                                       "displayName": "<app name>"}}]}
+#      Never grant "write" or "fullcontrol": the crawler only reads.
+#   4. To mirror who can see each site (see below) also add the Graph Application
+#      permissions Group.Read.All and User.Read.All (the same ones the mailbox
+#      Full Access lookup uses). They read directory data only, never files or mail.
+
+auth:
+  tenant_id_env: GRAPH_TENANT_ID
+  client_id_env: GRAPH_CLIENT_ID
+  secret_env: GRAPH_SECRET
+  authority: https://login.microsoftonline.com      # change for GCC High / China clouds
+  graph_endpoint: https://graph.microsoft.com/v1.0
+  scope: https://graph.microsoft.com/.default
+
+# ---- Global defaults (any site can override include_extensions etc.) --------
+
+# Whitelist mode: ONLY these extensions are crawled -- everything else is skipped,
+# including files with no extension at all. Checked case-insensitively. A site can
+# set its own `include_extensions` to replace this list.
+#
+# Unlike shares.yaml's SMB crawler (a blacklist, `exclude_extensions`), SharePoint
+# document libraries can end up holding an unbounded and ever-changing variety of
+# "web" file types -- a library that's really a web project's source tree, a
+# node_modules folder someone uploaded, etc. -- which a blacklist can never keep
+# up with. A whitelist of real document types needs no maintenance as new
+# "not a document" extensions appear.
+include_extensions:
+  - pdf
+  - doc
+  - docx
+  - xls
+  - xlsx
+  - ppt
+  - pptx
+  - txt
+  - csv
+  - rtf
+  - odt
+  - ods
+  - odp
+  - msg
+  - eml
+  - md
+  # Images: no body text, but camera/GPS EXIF metadata is extracted if present
+  # (see extract_text.py) -- same as the SMB/Exchange crawlers.
+  - jpg
+  - jpeg
+  - tif
+  - tiff
+  - png
+  - webp
+
+# Only used when include_extensions is EMPTY for a site (global or per-site) --
+# switches that site back to blacklist mode. Kept for shares.yaml-style setups
+# where a whitelist doesn't fit (e.g. a library with document types too varied
+# to enumerate, where it's easier to name the few things to skip instead).
+exclude_extensions: []
+exclude_no_extension: false
+
+# Document libraries to skip on every site (matched case-insensitively by name).
+# A site can set its own `exclude_libraries` to replace this list.
+exclude_libraries:
+  - Preservation Hold Library
+  - Style Library
+  - Form Templates
+  - Pages
+  - Notebook
+  - Conversations
+
+# Only index files last modified on/after this date. Omit for everything.
+# since: "2015-01-01"
+
+# Files larger than this are skipped (and logged).
+max_file_mb: 200
+
+# Remove documents from the index when the file is deleted in SharePoint.
+propagate_deletes: true
+
+# Incremental crawling uses per-library Graph delta tokens stored in the state
+# SQLite DB. Force a complete re-listing this often as a safety net (unchanged
+# files are still skipped, so it is cheap).
+full_recrawl_days: 30
+
+# ---- Who can see each site's files ------------------------------------------
+#
+# Written to the `role` field using the prefixes in pelican.yaml (roles:)
+# -- by default users = "1", groups = "2", roles = "R". If nobody is granted
+# access, the documents get the `restricted` role (fail closed, as for SMB).
+#
+# Access = the members and owners of the site's Microsoft 365 group (read from
+# Entra and mapped to AD names) + anything written by hand under `permissions:`.
+# If the roles change, files already indexed are updated in place -- no re-crawl.
+# If the group lookup fails, the last known access is kept rather than widened
+# or wiped.
+#
+# What this does NOT follow: SharePoint's own permission model. Per-file sharing,
+# restricted libraries, SharePoint-only groups and "everyone" grants inside a site
+# are not read (Graph can't list them without tenant-wide FullControl), so a file
+# restricted inside a site is still visible to everyone allowed for that site.
+# Sites with no Microsoft 365 group (communication sites, the root site) have no
+# members to mirror -- give them a `permissions:` block.
+#
+# Per site:
+#   group:            id or mail nickname of the Microsoft 365 group, if it differs
+#                     from the site URL name (/sites/Engineering -> "Engineering").
+#   mirror_members:   false to ignore the group and use only `permissions:`.
+#   permissions:      users (AD usernames), groups (AD group names, direct
+#                     membership only -- the search UI reads AD `memberOf`), roles.
+
+# ---- Sites ------------------------------------------------------------------
+#
+#   name:         unique source name (becomes the "Source" in search).
+#   url:          the site's full URL.
+#   libraries:    only crawl these document libraries (default: all).
+#   exclude_libraries / include_extensions / exclude_extensions /
+#   exclude_no_extension / since: override the global defaults above for
+#                 this site. Set include_extensions: [] on a site to switch
+#                 just that site to blacklist mode (exclude_extensions /
+#                 exclude_no_extension) without changing the global default.
+
+sites:
+  - name: engineering_sp
+    url: https://contoso.sharepoint.com/sites/Engineering
+    libraries:
+      - Documents
+    permissions:
+      groups: ["Records Management"]      # added on top of the site group's members
+
+  # - name: policies_sp                    # a communication site: no group to mirror
+  #   url: https://contoso.sharepoint.com/sites/Policies
+  #   mirror_members: false
+  #   permissions:
+  #     groups: ["All Staff"]

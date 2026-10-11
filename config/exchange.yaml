@@ -1,0 +1,129 @@
+# Exchange Online mailboxes for crawl_exchange.py. Example values -- replace
+# the `mailboxes:` entries with your own.
+# Lives next to shares.yaml and follows the same conventions: secrets come
+# from environment variables, one entry per source, global defaults that a
+# single entry can override.
+#
+# Documents go into the same OpenSearch index as the SMB crawl. The mailbox
+# `name` below is written to the `share` field, so keep it distinct from
+# names in shares.yaml (e.g. "jsmith_exchange", not "jsmith_mailbox_export").
+#
+# PREREQUISITES (Entra ID / Exchange Online):
+#   1. Register an app in Entra ID (single tenant).
+#   2. Create a client secret; put tenant ID / client ID / secret in the
+#      environment variables named under `auth:`.
+#   3. Grant mail access through Exchange Online RBAC for Applications ONLY:
+#      register the app with New-ServicePrincipal, then assign the
+#      "Application Mail.Read" role with a management scope covering just the
+#      mailboxes listed below (never Mail.ReadWrite). Verify with
+#      Test-ServicePrincipalAuthorization.
+#   4. IMPORTANT: do NOT also grant Mail.Read (or any Mail.* permission) in
+#      Entra ID / API permissions. Entra and Exchange RBAC grants are combined
+#      (union), and an Entra Mail.Read grant is tenant-wide -- it would
+#      silently override the scope above and expose every mailbox.
+#      (The older Application Access Policy route instead needs the Entra
+#      Mail.Read grant and restricts it from the Exchange side.)
+#   5. For automatic Full Access matching (see "Who can see each mailbox's
+#      mail" below): Graph application permissions User.Read.All (+ Group.Read.All),
+#      Exchange.ManageAsApp, a certificate on the app, and a read-only Exchange
+#      role for the app. None of these give access to mail.
+
+auth:
+  tenant_id_env: GRAPH_TENANT_ID
+  client_id_env: GRAPH_CLIENT_ID
+  secret_env: GRAPH_SECRET
+  authority: https://login.microsoftonline.com      # change for GCC High / China clouds
+  graph_endpoint: https://graph.microsoft.com/v1.0
+  scope: https://graph.microsoft.com/.default
+
+# ---- Global defaults (any mailbox can override exclude_folders / since) ----
+
+# Folders to skip, matched case-insensitively on display name. Subfolders of
+# an excluded folder are skipped too.
+exclude_folders:
+  - Deleted Items
+  - Junk Email
+  - Drafts
+  - Sync Issues
+  - Conversation History
+  - RSS Feeds
+
+# Only index mail received on/after this date. Omit for everything.
+# since: "2015-01-01"
+
+# Messages are fetched as full MIME (attachments included) and handed to
+# extract_text() as an .eml, exactly like the exported .eml files on the
+# SMB shares -- so body text and the email_* fields (including the attachment
+# filename list) come out the same as the SMB pipeline. exclude_extensions
+# does not apply here: attachments are not extracted separately. Messages
+# larger than this are skipped.
+max_message_mb: 100
+
+# Remove documents from the index when the mail is deleted or moved into an
+# excluded folder (e.g. Deleted Items).
+propagate_deletes: true
+
+# Incremental crawling uses per-folder Graph delta tokens stored in the
+# state SQLite DB. Force a complete re-enumeration this often as a safety net
+# (unchanged messages are still skipped, so it is cheap).
+full_recrawl_days: 30
+
+# ---- Who can see each mailbox's mail ---------------------------------------
+#
+# Written to the `role` field using the prefixes in pelican.yaml (roles:)
+# -- by default users = "1", groups = "2", roles = "R". If nobody is granted
+# access, the documents get the `restricted` role (fail closed, as for SMB).
+#
+# Access = the mailbox owner + everyone with Full Access to the mailbox in
+# Exchange Online (read automatically, see below) + anything written by hand
+# under a mailbox's `permissions:`.
+#
+# Full Access holders are exported by the exo-permissions job (see
+# exo-permissions/) into this file. Each crawler run applies it, and if access
+# changed, already-indexed mail is updated too -- no re-crawl needed. If the
+# export is missing, stale or fails for a mailbox, the crawler keeps that
+# mailbox's last known access rather than widening or wiping it.
+#
+# Each person/group in that list is mapped to their AD name through Entra (Graph):
+# users -> onPremisesSamAccountName, groups -> the CN in onPremisesDistinguishedName.
+# (Exchange Online's own SamAccountName is a generated placeholder, so it isn't
+# used.) This needs the Graph *application* permissions User.Read.All -- and
+# Group.Read.All if a group is ever granted Full Access -- with admin consent.
+# Those read directory profiles only; they give no access to anyone's mail. People
+# with no AD account (cloud-only, not synced) get no search access and are logged.
+permissions_file: /perm/exchange-permissions.json
+permissions_max_age_hours: 48       # treat an export older than this as unavailable
+
+# Hand-written `permissions:` (added on top of the above):
+#   users:  the username people sign in to the search UI with (sAMAccountName).
+#           Lower-cased automatically -- the search UI does the same.
+#   groups: AD group name (CN), the same names pelican/smb_acl.py produces for the
+#           SMB side, so mail and files line up. Only groups a user is a DIRECT
+#           member of match (the search UI reads AD `memberOf`, not nested groups).
+# Set `full_access: false` on a mailbox to ignore Exchange's Full Access list
+# for it and use only the hand-written permissions.
+
+mailboxes:
+  - name: jsmith_exchange
+    user: jsmith@example.com          # UPN or primary SMTP
+    permissions:
+      users: [jsmith]
+      # groups: ["Records Management"]
+
+  # Shared mailbox -- grant a group rather than individuals:
+  - name: accounts_exchange
+    user: accounts@example.com
+    permissions:
+      groups: ["Finance"]
+    since: "2020-01-01"
+    exclude_folders: [Deleted Items, Junk Email]   # replaces the global list
+
+  # Online Archive: NOT supported yet. Graph's /messages endpoints only serve
+  # the primary mailbox; an entry with `archive: true` is reported as failed
+  # on the status page rather than silently indexing the wrong mailbox.
+  # Archive mail exported as .eml/.msg files to an SMB share covers it meanwhile.
+  # - name: jsmith_online_archive
+  #   user: jsmith@example.com
+  #   archive: true
+  #   permissions:
+  #     users: [jsmith]

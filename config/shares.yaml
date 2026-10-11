@@ -1,0 +1,86 @@
+# SMB shares for crawl_smb.py (and sync_smb_acl.py). Example values --
+# replace the `shares:` entries with your own.
+#
+# Secrets never go in this file: each share names the environment variables
+# holding its credentials. A search UI that downloads straight from the share
+# (e.g. Frogmouth) can read this same file.
+
+# Extensions to skip crawling entirely -- checked case-insensitively.
+# Applies to every share below unless a share sets its own exclude_extensions.
+exclude_extensions:
+  - db
+  - zip
+  - exe
+  - msi
+  - dll
+  - bat
+  - cmd
+  - sh
+  - py
+  - jar
+  - p12        # certificate
+  - keystore
+  - ico
+  - ttf        # font
+  - tmp
+  - url
+  - html
+
+# Skip files with no extension at all (e.g. "README", "Makefile", lockfiles).
+# Applies globally unless a share sets its own exclude_no_extension.
+exclude_no_extension: true
+
+# Remove documents from the index once their file is deleted from the share.
+# Detected by a full listing each run (SMB has no change-feed), so a share
+# whose listing fails partway (e.g. a subfolder the crawl account loses read
+# access to) is reported failed and skips deletion for that run rather than
+# risk removing files it simply couldn't reach. Applies to every share; no
+# per-share override.
+propagate_deletes: true
+
+# Used by any share below that doesn't set its own user_env/pass_env/domain_env.
+default_credentials:
+  user_env: SMB_USER
+  pass_env: SMB_PASS
+  domain_env: SMB_DOMAIN
+
+# One entry per share/folder to crawl. Pelican connects directly via pysmb --
+# no host mount needed.
+#
+#   name:    unique source name (becomes the "Source" in search, the `share`
+#            field). Keep it distinct from mailbox and site names.
+#   server:  SMB server hostname or IP.
+#   share:   share name on that server.
+#   path:    folder within the share to crawl, backslash-separated, relative
+#            to the share root. "" crawls the entire share.
+#   user_env / pass_env / domain_env: override default_credentials.
+#   exclude_extensions / exclude_no_extension: override the globals above.
+#   acl_scope: "directory" (default) -- one cached ACL lookup per folder,
+#            assuming files inherit their folder's ACL; or "file" -- exact
+#            per-file lookups for shares with per-file permission overrides
+#            (slower: one smbcacls call per file).
+#
+# Shares are crawled in this file's order. Put small shares first: a share
+# crawled after hours of heavy I/O is more exposed to a flaky server.
+
+shares:
+  - name: finance
+    server: fileserver01.example.local
+    share: data
+    path: 'Finance'
+
+  - name: projects_archive
+    server: fileserver01.example.local
+    share: data
+    path: 'Projects\Archive'
+
+  # A second server with its own crawl account:
+  # - name: engineering
+  #   server: fileserver02.example.local
+  #   share: engineering
+  #   path: ""
+  #   user_env: SMB_USER_ENG
+  #   pass_env: SMB_PASS_ENG
+  #   domain_env: SMB_DOMAIN_ENG
+  #   exclude_extensions: [db, dwg, zip]
+  #   acl_scope: file

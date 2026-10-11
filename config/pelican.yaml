@@ -1,0 +1,70 @@
+# ---------------------------------------------------------------------
+# Pelican core settings, shared by every crawler (SMB, Exchange,
+# SharePoint, SMB ACL sync).
+#
+# This is the contract with whatever search UI reads the index: the index
+# name, how access roles are encoded, and the `host` value each crawler
+# stamps on its documents. Frogmouth's config.yaml must agree with it
+# (security.prefixes / security.default_roles and sources[].host).
+#
+# Any string value may reference an environment variable:
+#   ${VAR}            -> value of VAR (empty if unset)
+#   ${VAR:-fallback}  -> value of VAR, or "fallback" if unset/empty
+#
+# Override the path to this file with the PELICAN_CONFIG env var.
+# Per-source settings (what to crawl, credentials) stay in shares.yaml,
+# exchange.yaml and sharepoint.yaml alongside this file.
+# ---------------------------------------------------------------------
+
+opensearch:
+  host: "${OS_HOST:-http://opensearch:9200}"
+  index: "${SEARCH_INDEX:-documents}"
+  # Explicit mapping used when the index doesn't exist yet. A relative path
+  # is resolved against the app root (the folder holding config/), so the
+  # default finds the copy baked into the image.
+  mapping_file: "search_index_mapping.json"
+  timeout_seconds: 60
+
+# ---------------------------------------------------------------------
+# Access roles written into each document's `role` field. A search UI
+# shows a document to a user only if they hold at least one of its roles,
+# so it must build the user's roles with the same prefixes:
+#   <prefixes.user><username>   lower-cased
+#   <prefixes.group><group CN>
+#   <prefixes.role><role name>
+# everyone:   role for content open to all signed-in users (SMB ACL
+#             entries for Everyone / Authenticated Users)
+# restricted: role used to fail closed when access can't be determined
+# Changing these on an existing index needs every document's roles
+# rewritten (a full re-crawl), not just a config change.
+# ---------------------------------------------------------------------
+roles:
+  prefixes:
+    user: "1"
+    group: "2"
+    role: "R"
+  everyone: guest
+  restricted: admin
+
+# ---------------------------------------------------------------------
+# Value each crawler writes to a document's `host` field -- how the UI
+# tells sources apart (scope buttons, per-source result actions).
+# Changing one on an existing index orphans that source's documents.
+# ---------------------------------------------------------------------
+sources:
+  smb: smb-share
+  exchange: exchange-online
+  sharepoint: sharepoint-online
+
+# Incremental-crawl state (SQLite). Give every crawler container its own
+# volume; an SMB crawler and its ACL-sync container share one.
+state:
+  db_path: "${STATE_DB_PATH:-/state/pelican_state.db}"
+
+# Progress files read by the status page (status-page/).
+status:
+  dir: "${STATUS_DIR:-/status}"
+  job_name: "${JOB_NAME:-primary}"
+  # Status timestamps use the container's local time (set TZ, e.g.
+  # TZ=Europe/London). Uncomment to pin a fixed UTC offset instead.
+  # utc_offset_hours: 10

@@ -1,0 +1,149 @@
+# Example deployment: a single-node OpenSearch, one crawler per source,
+# the SMB ACL sync, the Exchange permission export, the status page, and
+# ofelia to run the one-shot jobs on a schedule.
+#
+#   cp .env.example .env            # fill in credentials
+#   edit config/*.yaml              # what to crawl
+#   docker compose -f docker-compose.example.yml up -d --build
+#
+# OpenSearch here runs with security disabled -- fine on a private network
+# for trying things out, not for production.
+
+x-crawler: &crawler
+  build: .
+  env_file: .env
+  networks: [search]
+  depends_on:
+    opensearch:
+      condition: service_healthy
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "5" }
+  # One-shot jobs, no restart policy -- triggered by ofelia below.
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:3
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g"
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - DISABLE_SECURITY_PLUGIN=true
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65535, hard: 65535 }
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    networks: [search]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+
+  # SMB: crawler + ACL sync share one state volume. To crawl several servers
+  # in parallel, add more pairs with their own SHARE_NAMES, JOB_NAME and volume.
+  crawl-smb:
+    <<: *crawler
+    container_name: pelican-crawl-smb
+    environment:
+      JOB_NAME: smb
+    volumes:
+      - state-smb:/state
+      - status:/status
+
+  sync-smb-acl:
+    <<: *crawler
+    container_name: pelican-sync-smb-acl
+    entrypoint: ["python", "-u", "sync_smb_acl.py"]
+    environment:
+      JOB_NAME: smb-acl
+    volumes:
+      - state-smb:/state
+      - status:/status
+
+  crawl-exchange:
+    <<: *crawler
+    container_name: pelican-crawl-exchange
+    entrypoint: ["python", "-u", "crawl_exchange.py"]
+    environment:
+      JOB_NAME: exchange
+    volumes:
+      - state-exchange:/state
+      - status:/status
+      - exo-permissions:/perm:ro
+
+  crawl-sharepoint:
+    <<: *crawler
+    container_name: pelican-crawl-sharepoint
+    entrypoint: ["python", "-u", "crawl_sharepoint.py"]
+    environment:
+      JOB_NAME: sharepoint
+    volumes:
+      - state-sharepoint:/state
+      - status:/status
+
+  # Exports mailbox Full Access holders for crawl-exchange. Needs a
+  # certificate on the Entra app: put it at secrets/exo.pfx.
+  exo-permissions:
+    build: ./exo-permissions
+    container_name: pelican-exo-permissions
+    env_file: .env
+    environment:
+      EXO_CERT_PATH: /run/secrets/exo.pfx
+      EXCHANGE_CONFIG: /app/exchange.yaml
+    volumes:
+      - ./config/exchange.yaml:/app/exchange.yaml:ro
+      - ./secrets/exo.pfx:/run/secrets/exo.pfx:ro
+      - exo-permissions:/perm
+    networks: [search]
+
+  status:
+    build: ./status-page
+    container_name: pelican-status
+    env_file: .env
+    volumes:
+      - status:/status
+    ports:
+      - "8090:8090"
+    networks: [search]
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ofelia:
+    image: mcuadros/ofelia:latest
+    command: daemon --docker
+    depends_on: [crawl-smb, sync-smb-acl, crawl-exchange, crawl-sharepoint, exo-permissions]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      ofelia.job-run.crawl-smb.schedule: "@every 6h"
+      ofelia.job-run.crawl-smb.container: "pelican-crawl-smb"
+      # More often than ACL_RECHECK_HOURS (default 24), so each folder is
+      # re-verified about that often regardless of how long crawls take.
+      ofelia.job-run.sync-smb-acl.schedule: "@every 2h"
+      ofelia.job-run.sync-smb-acl.container: "pelican-sync-smb-acl"
+      ofelia.job-run.crawl-exchange.schedule: "@every 6h"
+      ofelia.job-run.crawl-exchange.container: "pelican-crawl-exchange"
+      ofelia.job-run.crawl-sharepoint.schedule: "@every 6h"
+      ofelia.job-run.crawl-sharepoint.container: "pelican-crawl-sharepoint"
+      # Hourly, so a Full Access change is picked up by the next mail crawl.
+      ofelia.job-run.exo-permissions.schedule: "@every 1h"
+      ofelia.job-run.exo-permissions.container: "pelican-exo-permissions"
+    restart: unless-stopped
+
+networks:
+  search:
+
+volumes:
+  opensearch-data:
+  state-smb:
+  state-exchange:
+  state-sharepoint:
+  exo-permissions:
+  status:
