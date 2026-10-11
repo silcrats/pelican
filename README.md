@@ -120,6 +120,11 @@ search_index_mapping.json          index mapping
 status-page/, exo-permissions/     separate images
 ```
 
+## AI disclosure
+
+Much of this code was written with AI assistance (Anthropic's Claude), then
+reviewed and tested by the maintainers.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE)
