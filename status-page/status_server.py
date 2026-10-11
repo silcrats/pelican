@@ -1,7 +1,9 @@
+import base64
 import glob
 import http.server
 import json
 import os
+import ssl
 import threading
 import time
 import urllib.error
@@ -13,6 +15,11 @@ PORT = int(os.environ.get("PORT", "8090"))
 # --- OpenSearch storage view -------------------------------------------------
 OS_HOST = os.environ.get("OS_HOST", "http://opensearch:9200").rstrip("/")
 SEARCH_INDEX = os.environ.get("SEARCH_INDEX", "documents")
+# Sign-in for a secured cluster; OS_CA_CERTS if its certificate isn't from a public CA.
+OS_USERNAME = os.environ.get("OS_USERNAME", "")
+OS_PASSWORD = os.environ.get("OS_PASSWORD", "")
+_SSL = ssl.create_default_context(cafile=os.environ.get("OS_CA_CERTS") or None)
+_AUTH = {"Authorization": "Basic " + base64.b64encode(f"{OS_USERNAME}:{OS_PASSWORD}".encode()).decode()} if OS_USERNAME else {}
 STORAGE_REFRESH_SECONDS = int(os.environ.get("STORAGE_REFRESH_SECONDS", "900"))   # how often to re-query OpenSearch
 SAMPLE_DOCS = int(os.environ.get("STORAGE_SAMPLE_DOCS", "100"))                   # random docs fetched per source
 SAMPLE_TTL_SECONDS = int(os.environ.get("STORAGE_SAMPLE_TTL_SECONDS", "3600"))    # re-sample a source's avg doc size this often
@@ -350,9 +357,9 @@ _avg_doc_cache: dict = {}   # source name -> (sampled_at, avg stored doc bytes)
 def _os(method: str, path: str, body=None):
     payload = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(OS_HOST + path, data=payload, method=method,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", **_AUTH})
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=60, context=_SSL) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:300]

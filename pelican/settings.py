@@ -52,6 +52,9 @@ _status = _cfg.get("status") or {}
 OS_HOST: str = _os.get("host") or "http://opensearch:9200"
 SEARCH_INDEX: str = _os.get("index") or "documents"
 OS_TIMEOUT: int = int(_os.get("timeout_seconds") or 60)
+OS_USERNAME: str = _os.get("username") or ""
+OS_PASSWORD: str = _os.get("password") or ""
+OS_CA_CERTS: str = _os.get("ca_certs") or ""
 _mapping = _os.get("mapping_file") or "search_index_mapping.json"
 INDEX_MAPPING_PATH: str = _mapping if os.path.isabs(_mapping) else os.path.join(APP_ROOT, _mapping)
 

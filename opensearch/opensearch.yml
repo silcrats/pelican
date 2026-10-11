@@ -1,0 +1,20 @@
+# OpenSearch config for the compose example: security plugin on, TLS with the
+# certificates the opensearch-certs job creates in the `certs` volume
+# (mounted at config/certs). Users are created by the opensearch-users job.
+cluster.name: pelican
+network.host: 0.0.0.0
+
+plugins.security.ssl.transport.pemcert_filepath: certs/node.pem
+plugins.security.ssl.transport.pemkey_filepath: certs/node-key.pem
+plugins.security.ssl.transport.pemtrustedcas_filepath: certs/ca.pem
+plugins.security.ssl.http.enabled: true
+plugins.security.ssl.http.pemcert_filepath: certs/node.pem
+plugins.security.ssl.http.pemkey_filepath: certs/node-key.pem
+plugins.security.ssl.http.pemtrustedcas_filepath: certs/ca.pem
+
+plugins.security.nodes_dn: ["CN=opensearch,O=Pelican"]
+# Holder of this certificate (admin.pem) may manage users and roles.
+plugins.security.authcz.admin_dn: ["CN=pelican-admin,O=Pelican"]
+# First start: create the security index from opensearch-security/*.yml.
+plugins.security.allow_default_init_securityindex: true
+plugins.security.restapi.roles_enabled: ["all_access"]

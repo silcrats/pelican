@@ -24,6 +24,9 @@ client = OpenSearch(
                                    # crawlers write concurrently and the cluster is under real load
     max_retries=3,
     retry_on_timeout=True,         # transient slow responses get retried instead of aborting a whole source
+    http_auth=(settings.OS_USERNAME, settings.OS_PASSWORD) if settings.OS_USERNAME else None,
+    verify_certs=True,             # https hosts only; plain http ignores it
+    ca_certs=settings.OS_CA_CERTS or None,
 )
 
 

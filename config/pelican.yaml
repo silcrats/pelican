@@ -18,6 +18,13 @@
 
 opensearch:
   host: "${OS_HOST:-http://opensearch:9200}"
+  # Sign-in for a secured cluster (https:// host). Leave empty for a cluster
+  # without the security plugin. ca_certs: the CA that signed the server's
+  # certificate, if it isn't a public one (the compose example's is
+  # /certs/ca.pem).
+  username: "${OS_USERNAME}"
+  password: "${OS_PASSWORD}"
+  ca_certs: "${OS_CA_CERTS}"
   index: "${SEARCH_INDEX:-documents}"
   # Explicit mapping used when the index doesn't exist yet. A relative path
   # is resolved against the app root (the folder holding config/), so the

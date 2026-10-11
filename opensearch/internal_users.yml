@@ -1,0 +1,5 @@
+# Replaces the image's demo user list, whose passwords are public. Accounts
+# are created through the API by the opensearch-users job instead.
+_meta:
+  type: "internalusers"
+  config_version: 2

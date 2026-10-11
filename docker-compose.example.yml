@@ -10,8 +10,18 @@
 # pin a release (default: latest). Add --build to build from this checkout
 # instead.
 #
-# OpenSearch here runs with security disabled -- fine on a private network
-# for trying things out, not for production.
+# OpenSearch runs with its security plugin: HTTPS with certificates
+# generated on first start (opensearch-certs), and one account per
+# component with only the access it needs (opensearch-users). Set the
+# OS_*_PASSWORD values in .env first. It's still a single node with no
+# backups -- see the README before relying on it.
+
+# How the crawlers reach OpenSearch. Merged into each crawler's environment
+# (a service's own environment: replaces, not extends, an anchor's).
+x-opensearch-env: &opensearch-env
+  OS_HOST: https://opensearch:9200
+  OS_USERNAME: pelican
+  OS_CA_CERTS: /certs/ca.pem
 
 x-crawler: &crawler
   image: ghcr.io/silcrats/pelican:${PELICAN_VERSION:-latest}
@@ -19,35 +29,69 @@ x-crawler: &crawler
   env_file: .env
   networks: [search]
   depends_on:
-    opensearch:
-      condition: service_healthy
+    opensearch-users:
+      condition: service_completed_successfully
   logging:
     driver: json-file
     options: { max-size: "10m", max-file: "5" }
   # One-shot jobs, no restart policy -- triggered by ofelia below.
 
 services:
+  # One-shot: creates the CA and certificates in the certs volume on first
+  # start, then does nothing. Delete the volume to re-issue them.
+  opensearch-certs:
+    image: ghcr.io/silcrats/pelican:${PELICAN_VERSION:-latest}
+    build: .
+    user: "0"   # to give each key to the user that needs it
+    entrypoint: ["python", "-u", "-m", "pelican.opensearch_setup", "certs"]
+    volumes:
+      - certs:/certs
+
   opensearch:
     image: opensearchproject/opensearch:3
     environment:
       - discovery.type=single-node
       - bootstrap.memory_lock=true
       - "OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g"
+      # The demo setup's certificates and users are public; ours replace them.
       - DISABLE_INSTALL_DEMO_CONFIG=true
-      - DISABLE_SECURITY_PLUGIN=true
     ulimits:
       memlock: { soft: -1, hard: -1 }
       nofile: { soft: 65535, hard: 65535 }
     volumes:
       - opensearch-data:/usr/share/opensearch/data
+      - certs:/usr/share/opensearch/config/certs:ro
+      - ./opensearch/opensearch.yml:/usr/share/opensearch/config/opensearch.yml:ro
+      - ./opensearch/internal_users.yml:/usr/share/opensearch/config/opensearch-security/internal_users.yml:ro
     networks: [search]
+    depends_on:
+      opensearch-certs:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      # 401 (sign-in required) means it's up.
+      test: ["CMD-SHELL", "curl -sk -o /dev/null -w '%{http_code}' https://localhost:9200 | grep -qE '200|401'"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 90s
     restart: unless-stopped
+
+  # One-shot: creates or updates the OpenSearch accounts from the
+  # OS_*_PASSWORD values in .env, signing in with the admin certificate.
+  # Re-run it after changing a password: docker compose ... up opensearch-users
+  opensearch-users:
+    image: ghcr.io/silcrats/pelican:${PELICAN_VERSION:-latest}
+    build: .
+    entrypoint: ["python", "-u", "-m", "pelican.opensearch_setup", "users"]
+    env_file: .env
+    environment:
+      OS_HOST: https://opensearch:9200
+    volumes:
+      - certs:/certs:ro
+    networks: [search]
+    depends_on:
+      opensearch:
+        condition: service_healthy
 
   # SMB: crawler + ACL sync share one state volume. To crawl several servers
   # in parallel, add more pairs with their own SHARE_NAMES, JOB_NAME and volume.
@@ -55,41 +99,49 @@ services:
     <<: *crawler
     container_name: pelican-crawl-smb
     environment:
+      <<: *opensearch-env
       JOB_NAME: smb
     volumes:
       - state-smb:/state
       - status:/status
+      - certs:/certs:ro
 
   sync-smb-acl:
     <<: *crawler
     container_name: pelican-sync-smb-acl
     entrypoint: ["python", "-u", "sync_smb_acl.py"]
     environment:
+      <<: *opensearch-env
       JOB_NAME: smb-acl
     volumes:
       - state-smb:/state
       - status:/status
+      - certs:/certs:ro
 
   crawl-exchange:
     <<: *crawler
     container_name: pelican-crawl-exchange
     entrypoint: ["python", "-u", "crawl_exchange.py"]
     environment:
+      <<: *opensearch-env
       JOB_NAME: exchange
     volumes:
       - state-exchange:/state
       - status:/status
       - exo-permissions:/perm:ro
+      - certs:/certs:ro
 
   crawl-sharepoint:
     <<: *crawler
     container_name: pelican-crawl-sharepoint
     entrypoint: ["python", "-u", "crawl_sharepoint.py"]
     environment:
+      <<: *opensearch-env
       JOB_NAME: sharepoint
     volumes:
       - state-sharepoint:/state
       - status:/status
+      - certs:/certs:ro
 
   # Exports mailbox Full Access holders for crawl-exchange. Needs a
   # certificate on the Entra app: put it at secrets/exo.pfx.
@@ -112,14 +164,20 @@ services:
     build: ./status-page
     container_name: pelican-status
     env_file: .env
+    environment:
+      OS_HOST: https://opensearch:9200
+      OS_USERNAME: pelican-status
+      OS_PASSWORD: ${OS_STATUS_PASSWORD:?set OS_STATUS_PASSWORD in .env}
+      OS_CA_CERTS: /certs/ca.pem
     volumes:
       - status:/status
+      - certs:/certs:ro
     ports:
       - "8090:8090"
     networks: [search]
     depends_on:
-      opensearch:
-        condition: service_healthy
+      opensearch-users:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   ofelia:
@@ -149,6 +207,7 @@ networks:
 
 volumes:
   opensearch-data:
+  certs:
   state-smb:
   state-exchange:
   state-sharepoint:
