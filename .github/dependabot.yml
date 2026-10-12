@@ -10,10 +10,25 @@ updates:
       pip: { patterns: ["*"], update-types: [minor, patch] }
 
   - package-ecosystem: docker
-    directories: [/, /status-page]
+    directories: [/, /status-page, /exo-permissions]
     schedule: { interval: weekly }
     ignore:
       - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: ubuntu
+        update-types: ["version-update:semver-major"]
+  # PowerShell in exo-permissions is installed from a release file
+  # (PWSH_VERSION / PWSH_SHA256 in its Dockerfile): update it by hand.
+
+  # Images in docker-compose.example.yml. OpenSearch majors and HAProxy moves
+  # off its 3.2 long-term-support line stay manual.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule: { interval: weekly }
+    ignore:
+      - dependency-name: opensearchproject/opensearch
+        update-types: ["version-update:semver-major"]
+      - dependency-name: haproxy
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: github-actions

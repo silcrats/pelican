@@ -48,7 +48,9 @@ services:
       - certs:/certs
 
   opensearch:
-    image: opensearchproject/opensearch:3
+    # Pinned: OpenSearch upgrades its data on disk and can't be downgraded,
+    # so move to a new version deliberately (and back up first).
+    image: opensearchproject/opensearch:3.9.0
     environment:
       - discovery.type=single-node
       - bootstrap.memory_lock=true
@@ -184,12 +186,28 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
-  ofelia:
-    image: mcuadros/ofelia:latest
-    command: daemon --docker
-    depends_on: [crawl-smb, sync-smb-acl, crawl-exchange, crawl-sharepoint, exo-permissions]
+  # ofelia starts the job containers through this proxy instead of the
+  # Docker socket itself, which would let anyone controlling ofelia control
+  # the host. The proxy forwards only what ofelia uses: reading containers'
+  # details and logs, and starting existing containers. Container details
+  # include environment variables, so ofelia can still read the jobs'
+  # credentials -- but not create or change containers.
+  docker-api-proxy:
+    image: haproxy:3.2.25
+    user: "0"   # to open the Docker socket
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./ofelia/docker-api-proxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks: [docker-api]
+    restart: unless-stopped
+
+  ofelia:
+    image: mcuadros/ofelia:0.3.22
+    command: daemon --docker
+    environment:
+      DOCKER_HOST: tcp://docker-api-proxy:2375
+    depends_on: [docker-api-proxy, crawl-smb, sync-smb-acl, crawl-exchange, crawl-sharepoint, exo-permissions]
+    networks: [docker-api]
     labels:
       ofelia.job-run.crawl-smb.schedule: "@every 6h"
       ofelia.job-run.crawl-smb.container: "pelican-crawl-smb"
@@ -208,6 +226,9 @@ services:
 
 networks:
   search:
+  # Only ofelia and the proxy; no route out.
+  docker-api:
+    internal: true
 
 volumes:
   opensearch-data:

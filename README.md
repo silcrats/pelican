@@ -94,9 +94,15 @@ Tuning (all optional): `BATCH_SIZE`, `SMB_WORKERS`, `GRAPH_WORKERS`,
 `SMB_LIST_TIMEOUT_SECONDS`, `SMB_FETCH_TIMEOUT_SECONDS`,
 `SMB_LIST_STALL_SECONDS`, `GRAPH_MAX_RETRIES`.
 
-The crawler and status images run as UID 10001, not root. Anything you
-mount (config, `secrets/`, state and status volumes) must be readable by that
-user, and the state and status volumes writable.
+All three images run as UID 10001, not root. Anything you mount (config,
+`secrets/exo.pfx`, the state, status and permissions volumes) must be
+readable by that user, and the volumes writable.
+
+In the compose example, ofelia doesn't get the Docker socket: it goes through
+`docker-api-proxy`, which allows only reading containers and starting existing
+ones ([ofelia/docker-api-proxy.cfg](ofelia/docker-api-proxy.cfg)). With the
+socket itself, anyone who took over ofelia would control the host. Third-party
+images are pinned to exact versions; Dependabot proposes updates.
 
 ## OpenSearch security
 
@@ -181,6 +187,7 @@ requirements.in                    direct dependencies; requirements.txt is
                                    the pinned, hashed lock (pip-compile)
 status-page/, exo-permissions/     separate images
 opensearch/                        OpenSearch security config (compose example)
+ofelia/                            Docker API proxy config for the scheduler
 ```
 
 ## AI disclosure
