@@ -1,0 +1,13 @@
+# SMB config for the integration test: the test Samba server's read-only
+# share. Same exclusions as config/shares.yaml for the extensions tested.
+exclude_extensions: [zip]
+exclude_no_extension: true
+default_credentials:
+  user_env: SMB_USER
+  pass_env: SMB_PASS
+  domain_env: SMB_DOMAIN
+shares:
+  - name: test-finance
+    server: samba
+    share: Shared
+    path: 'Finance'

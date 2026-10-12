@@ -15,6 +15,11 @@ search UI built for it.
   modification time, deletion detection with guards against wiping a share
   on a bad listing, and per-folder ACLs via `smbcacls` with a separate job that
   re-applies permission changes without re-downloading anything.
+  Works with Windows file servers. **Samba servers (including most NAS
+  devices) on their default settings refuse the connection** ("Server does
+  not support any of the pysmb dialects"): pysmb opens with an SMB1-format
+  negotiation, which Samba ignores unless `server min protocol = NT1`, and
+  that setting also allows SMB1 sessions.
 - **Exchange Online** via Microsoft Graph delta queries: full MIME per message,
   attachment text, Full Access holders mapped to AD accounts.
 - **SharePoint Online** via Graph with `Sites.Selected` (only the sites you
@@ -150,6 +155,33 @@ folder, add the `OS_*_PASSWORD` values to `.env`, and run
 `docker compose up -d`. The existing index is kept. Search UIs then need
 the new address, sign-in and CA.
 
+## Backups
+
+The compose example snapshots the index every night (02:00 in `TZ`, keeping
+the last 14) into the `opensearch-snapshots` volume. OpenSearch runs the
+schedule itself; the `opensearch-users` job sets it up from
+`OS_SNAPSHOT_SCHEDULE` (cron, or `off`) and `OS_SNAPSHOT_KEEP` in `.env`.
+
+That volume is on the same disk as the index, so it protects against
+mistakes and corruption, not a failed disk. Copy it off the host, or mount
+other storage there instead (in `docker-compose.example.yml`).
+
+Signed in as `admin`:
+
+```sh
+# list snapshots
+curl -sk -u admin https://localhost:9200/_cat/snapshots/pelican-backups?v
+# restore one (stop the crawlers and delete or close the index first)
+curl -sk -u admin -XPOST -H 'Content-Type: application/json' \
+  https://localhost:9200/_snapshot/pelican-backups/<snapshot>/_restore \
+  -d '{"indices": "documents"}'
+```
+
+Run these from inside the OpenSearch container (`docker compose exec
+opensearch ...`); port 9200 isn't published. The crawlers' state volumes
+aren't snapshotted: if one is lost, that crawler re-indexes its sources on
+its next run.
+
 ## Index contract
 
 Any search UI reading the index must agree with `config/pelican.yaml`:
@@ -188,7 +220,22 @@ requirements.in                    direct dependencies; requirements.txt is
 status-page/, exo-permissions/     separate images
 opensearch/                        OpenSearch security config (compose example)
 ofelia/                            Docker API proxy config for the scheduler
+tests/integration/                 end-to-end test (run.sh)
 ```
+
+## Testing
+
+```sh
+tests/integration/run.sh
+```
+
+builds the images from your checkout and runs the compose example with a
+test Samba server: a real SMB crawl (text, Word and PDF extraction, ACL
+roles, exclusions), the ACL sync, every OpenSearch account's permissions,
+the status page sign-in, snapshots and the scheduler proxy. It uses its
+own project name, volumes and ports, so it can run next to a real
+deployment. GitHub Actions runs it before building any image, including
+on Dependabot's pull requests.
 
 ## AI disclosure
 

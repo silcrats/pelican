@@ -5,9 +5,10 @@ OpenSearch security setup for the compose example, run as two one-shot jobs:
   python -m pelican.opensearch_setup users   once OpenSearch is healthy
 
 `certs` creates a private CA, a server certificate for the `opensearch`
-host and an admin client certificate in CERTS_DIR, if they're not there yet.
-Run it as root: it hands the server key to OpenSearch's user (1000) and the
-admin key to Pelican's (10001).
+host and an admin client certificate in CERTS_DIR, if they're not there yet,
+and gives the snapshot volume (SNAPSHOT_DIR) to OpenSearch. Run it as root:
+it hands the server key and snapshot folder to OpenSearch's user (1000) and
+the admin key to Pelican's (10001).
 
 `users` signs in with the admin certificate and creates (or updates) the
 accounts and their roles from environment variables:
@@ -17,7 +18,14 @@ accounts and their roles from environment variables:
   OS_READER_PASSWORD   `pelican-reader`: search UI -- read only    (optional)
   OS_ADMIN_PASSWORD    `admin`: full access, for you               (optional)
 
-Re-running it applies password changes from the environment.
+It then registers the snapshot repository and a snapshot policy for the
+index (OpenSearch runs the policy itself):
+
+  OS_SNAPSHOT_SCHEDULE   cron, in TZ (default UTC); default "0 2 * * *",
+                         "off" to not set up backups
+  OS_SNAPSHOT_KEEP       how many snapshots to keep (default 14)
+
+Re-running it applies password and schedule changes from the environment.
 """
 
 import datetime
@@ -34,6 +42,11 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from . import settings
 
 CERTS_DIR = os.environ.get("CERTS_DIR", "/certs")
+SNAPSHOT_DIR = os.environ.get("SNAPSHOT_DIR", "/snapshots")
+# Where OpenSearch sees the snapshot volume (path.repo in opensearch.yml).
+SNAPSHOT_LOCATION = "/usr/share/opensearch/snapshots"
+SNAPSHOT_REPOSITORY = "pelican-backups"
+SNAPSHOT_POLICY = "pelican-daily"
 OS_UID = 1000        # the OpenSearch image's user
 PELICAN_UID = 10001  # the Pelican images' user
 VALID_DAYS = 3650
@@ -86,6 +99,8 @@ def _issue(cn, ca_key, ca_name, usages, sans=None, ca=False):
 
 
 def make_certs() -> None:
+    if os.path.isdir(SNAPSHOT_DIR):
+        os.chown(SNAPSHOT_DIR, OS_UID, OS_UID)
     if os.path.exists(os.path.join(CERTS_DIR, "ca.pem")):
         print(f"[certs] {CERTS_DIR}/ca.pem exists, leaving certificates as they are")
         return
@@ -107,13 +122,22 @@ def make_certs() -> None:
     print(f"[certs] created CA, server and admin certificates in {CERTS_DIR}, valid {VALID_DAYS} days")
 
 
-def _api(method: str, path: str, body: dict) -> None:
+def _request(method: str, path: str, body: dict | None = None, ok_missing: bool = False) -> dict | None:
+    """Call OpenSearch with the admin certificate. With ok_missing, a 404
+    returns None instead of raising."""
     resp = requests.request(
-        method, f"{settings.OS_HOST.rstrip('/')}/_plugins/_security/api/{path}", json=body,
+        method, f"{settings.OS_HOST.rstrip('/')}{path}", json=body,
         cert=(os.path.join(CERTS_DIR, "admin.pem"), os.path.join(CERTS_DIR, "admin-key.pem")),
         verify=os.path.join(CERTS_DIR, "ca.pem"), timeout=60)
+    if ok_missing and resp.status_code == 404:
+        return None
     if not resp.ok:
         raise RuntimeError(f"{method} {path}: {resp.status_code} {resp.text[:300]}")
+    return resp.json()
+
+
+def _api(method: str, path: str, body: dict) -> None:
+    _request(method, f"/_plugins/_security/api/{path}", body)
 
 
 def _account(user: str, password: str, role: str, role_body: dict | None) -> None:
@@ -139,9 +163,10 @@ def make_users() -> None:
                                 "indices:data/read/scroll/clear", "cluster:monitor/task/get"],
         "index_permissions": [{
             "index_patterns": [index],
-            # search_shards and refresh: update_by_query (slices="auto", refresh=True).
+            # search_shards and refresh*: update_by_query (slices="auto", refresh=True)
+            # and refreshing the index (refresh* includes the per-shard action).
             "allowed_actions": ["crud", "create_index", "indices:admin/get", "indices:admin/mappings/get",
-                                "indices:admin/shards/search_shards", "indices:admin/refresh"],
+                                "indices:admin/shards/search_shards", "indices:admin/refresh*"],
         }],
     })
     _account("pelican-status", passwords["OS_STATUS_PASSWORD"], "pelican_status", {
@@ -154,6 +179,52 @@ def make_users() -> None:
         })
     if passwords["OS_ADMIN_PASSWORD"]:
         _account("admin", passwords["OS_ADMIN_PASSWORD"], "all_access", None)
+    setup_snapshots(index)
+
+
+def setup_snapshots(index: str) -> None:
+    schedule = os.environ.get("OS_SNAPSHOT_SCHEDULE") or "0 2 * * *"
+    if schedule.lower() == "off":
+        print("[snapshots] OS_SNAPSHOT_SCHEDULE=off, not setting up backups")
+        return
+    keep = int(os.environ.get("OS_SNAPSHOT_KEEP") or 14)
+    tz = os.environ.get("TZ") or "UTC"
+    _request("PUT", f"/_snapshot/{SNAPSHOT_REPOSITORY}",
+             {"type": "fs", "settings": {"location": SNAPSHOT_LOCATION}})
+    policy = {
+        "description": f"Snapshot of the {index} index",
+        "creation": {"schedule": {"cron": {"expression": schedule, "timezone": tz}}},
+        # Old snapshots are pruned an hour after each creation run.
+        "deletion": {
+            "schedule": {"cron": {"expression": _an_hour_later(schedule), "timezone": tz}},
+            "condition": {"max_count": keep, "min_count": 1},
+        },
+        "snapshot_config": {
+            "indices": index,
+            "repository": SNAPSHOT_REPOSITORY,
+            "include_global_state": False,
+            "ignore_unavailable": True,   # no index yet before the first crawl
+            "date_format": "yyyy-MM-dd-HH-mm",
+        },
+    }
+    path = f"/_plugins/_sm/policies/{SNAPSHOT_POLICY}"
+    existing = _request("GET", path, ok_missing=True)
+    if existing is None:
+        _request("POST", path, policy)
+    else:  # updates must name the version they replace
+        _request("PUT", f"{path}?if_seq_no={existing['_seq_no']}&if_primary_term={existing['_primary_term']}",
+                 policy)
+    print(f"[snapshots] {index} -> repository {SNAPSHOT_REPOSITORY}: cron \"{schedule}\" ({tz}), keep {keep}")
+
+
+def _an_hour_later(cron: str) -> str:
+    """The same schedule one hour later, for the pruning run. Falls back to
+    hourly at :30 if the hour field isn't a plain number."""
+    fields = cron.split()
+    if len(fields) == 5 and fields[1].isdigit():
+        fields[1] = str((int(fields[1]) + 1) % 24)
+        return " ".join(fields)
+    return "30 * * * *"
 
 
 if __name__ == "__main__":

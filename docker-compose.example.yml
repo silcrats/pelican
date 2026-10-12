@@ -46,6 +46,7 @@ services:
     entrypoint: ["python", "-u", "-m", "pelican.opensearch_setup", "certs"]
     volumes:
       - certs:/certs
+      - opensearch-snapshots:/snapshots   # handed to OpenSearch's user
 
   opensearch:
     # Pinned: OpenSearch upgrades its data on disk and can't be downgraded,
@@ -62,6 +63,9 @@ services:
       nofile: { soft: 65535, hard: 65535 }
     volumes:
       - opensearch-data:/usr/share/opensearch/data
+      # Daily snapshots of the index. On the same disk as the data, so copy
+      # this volume elsewhere, or replace it with a path on other storage.
+      - opensearch-snapshots:/usr/share/opensearch/snapshots
       - certs:/usr/share/opensearch/config/certs:ro
       - ./opensearch/opensearch.yml:/usr/share/opensearch/config/opensearch.yml:ro
       - ./opensearch/internal_users.yml:/usr/share/opensearch/config/opensearch-security/internal_users.yml:ro
@@ -79,7 +83,9 @@ services:
     restart: unless-stopped
 
   # One-shot: creates or updates the OpenSearch accounts from the
-  # OS_*_PASSWORD values in .env, signing in with the admin certificate.
+  # OS_*_PASSWORD values in .env, and the daily snapshot policy
+  # (OS_SNAPSHOT_SCHEDULE, OS_SNAPSHOT_KEEP), signing in with the admin
+  # certificate.
   # Re-run it after changing a password: docker compose ... up opensearch-users
   opensearch-users:
     image: ghcr.io/silcrats/pelican:${PELICAN_VERSION:-latest}
@@ -232,6 +238,7 @@ networks:
 
 volumes:
   opensearch-data:
+  opensearch-snapshots:
   certs:
   state-smb:
   state-exchange:

@@ -18,3 +18,7 @@ plugins.security.authcz.admin_dn: ["CN=pelican-admin,O=Pelican"]
 # First start: create the security index from opensearch-security/*.yml.
 plugins.security.allow_default_init_securityindex: true
 plugins.security.restapi.roles_enabled: ["all_access"]
+
+# Snapshot repository (the opensearch-snapshots volume); the opensearch-users
+# job registers it and the daily snapshot policy.
+path.repo: ["/usr/share/opensearch/snapshots"]

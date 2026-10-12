@@ -84,6 +84,8 @@ def _query_acl_raising(share: dict, smb_path: str) -> list[str]:
         else:
             found.append(role_store.group_role(name))
 
+    # A principal with several entries (e.g. inherited and explicit) counts once.
+    found = list(dict.fromkeys(found))
     return found or [role_store.RESTRICTED]  # a real ACL with no usable grants -- restrict rather than open up
 
 

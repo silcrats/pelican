@@ -3,7 +3,9 @@
 #   git tag v0.1.1 && git push origin v0.1.1
 #
 # produces ghcr.io/silcrats/<image>:0.1.1, :0.1 and :latest. Pushes to main
-# publish :main; pull requests only build, to check the images still build.
+# publish :main; pull requests only build. Every run first runs the
+# integration test (tests/integration/run.sh); nothing is built or published
+# unless it passes.
 name: Publish images
 
 on:
@@ -19,7 +21,17 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      # OpenSearch refuses to start below this.
+      - run: sudo sysctl -w vm.max_map_count=262144
+      - run: tests/integration/run.sh
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

@@ -1,0 +1,51 @@
+# Overlay on docker-compose.example.yml for the integration test: adds a
+# Samba server with fixture files and points the SMB jobs at it.
+#
+#   tests/integration/run.sh
+services:
+  smb-fixtures:
+    image: ghcr.io/silcrats/pelican:${PELICAN_VERSION:-latest}
+    user: "0"
+    entrypoint: ["python", "/tests/make_smb_fixtures.py", "/out"]
+    volumes:
+      - ./tests/integration:/tests:ro
+      - smb-data:/out
+
+  samba:
+    image: dockurr/samba:4.23.10
+    # pysmb always opens with an SMB1-format negotiate offering SMB2, which
+    # Windows answers but Samba ignores unless it accepts SMB1 negotiation.
+    # The session itself still uses SMB2.
+    entrypoint: ["/sbin/tini", "--", "sh", "-c",
+                 "sed -i 's/server min protocol = SMB2/server min protocol = NT1/' /etc/samba/smb.default && exec /usr/bin/samba.sh"]
+    environment:
+      USER: pelican-test
+      PASS: Smb-Test-Pw-1
+      RW: "false"
+    volumes:
+      - smb-data:/storage
+    networks: [search]
+    depends_on:
+      smb-fixtures:
+        condition: service_completed_successfully
+
+  # Its own name and port, so the test can run next to a real deployment.
+  status:
+    container_name: pelican-itest-status
+    ports: !override
+      - "18090:8090"
+
+  crawl-smb:
+    environment:
+      SHARES_CONFIG: /tests/shares.yaml
+    volumes:
+      - ./tests/integration:/tests:ro
+
+  sync-smb-acl:
+    environment:
+      SHARES_CONFIG: /tests/shares.yaml
+    volumes:
+      - ./tests/integration:/tests:ro
+
+volumes:
+  smb-data:
