@@ -53,8 +53,10 @@ scheduled by [ofelia](https://github.com/mcuadros/ofelia), and the status
 page on <http://localhost:8090> (sign in as `pelican` with `STATUS_PASSWORD`).
 Remove the services you don't need.
 
-Each crawler is a one-shot process: it crawls once and exits. The image
-defaults to `crawl_smb.py`; choose another job with an entrypoint override.
+Each crawler is a one-shot process: it crawls once and exits. If any share,
+mailbox or site fails, it still crawls the rest, then exits with status 1
+and lists the failures (the status page shows why). The image defaults to
+`crawl_smb.py`; choose another job with an entrypoint override.
 
 | Job | Purpose | Config |
 | --- | --- | --- |

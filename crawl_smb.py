@@ -30,6 +30,7 @@ kept from causing a wrong mass deletion.
 import os
 import queue
 import sqlite3
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait, as_completed
@@ -418,6 +419,11 @@ def run() -> None:
     state_db.close()
     print(f"Total indexed across all shares: {grand_total}")
     status.job_finished()
+    # Non-zero exit so the scheduler and monitoring see the failure; the
+    # status page shows which share and why.
+    failed = status.failed_sources()
+    if failed:
+        sys.exit(f"{len(failed)} share(s) failed: {', '.join(failed)}")
 
 
 if __name__ == "__main__":

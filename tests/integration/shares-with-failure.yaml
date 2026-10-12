@@ -1,0 +1,17 @@
+# Like shares.yaml plus a share that doesn't exist on the server: the crawl
+# must still index test-finance, and exit non-zero naming test-missing.
+exclude_extensions: [zip]
+exclude_no_extension: true
+default_credentials:
+  user_env: SMB_USER
+  pass_env: SMB_PASS
+  domain_env: SMB_DOMAIN
+shares:
+  - name: test-finance
+    server: samba
+    share: Shared
+    path: 'Finance'
+  - name: test-missing
+    server: samba
+    share: NoSuchShare
+    path: ''

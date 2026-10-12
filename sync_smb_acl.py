@@ -13,6 +13,8 @@ first exist anyway.
 Set SHARE_NAMES to the same subset as the crawler sharing this state volume.
 """
 
+import sys
+
 from pelican import roles as role_store
 from pelican import smb_acl, smb_shares, state, status
 from pelican.index import SEARCH_INDEX, client
@@ -42,6 +44,11 @@ def run() -> None:
 
     state_db.close()
     status.job_finished()
+    # Non-zero exit so the scheduler and monitoring see the failure; the
+    # status page shows which share and why.
+    failed = status.failed_sources()
+    if failed:
+        sys.exit(f"{len(failed)} share(s) failed: {', '.join(failed)}")
 
 
 if __name__ == "__main__":

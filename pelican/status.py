@@ -138,6 +138,11 @@ def share_failed(name: str, error: str) -> None:
     _write()
 
 
+def failed_sources() -> list[str]:
+    """Names of this run's shares/mailboxes/sites that failed."""
+    return [name for name, s in _status["shares"].items() if s["status"] == "failed"]
+
+
 def job_finished() -> None:
     _status["status"] = "idle"
     _status["current_share"] = None

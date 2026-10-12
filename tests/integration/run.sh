@@ -86,6 +86,16 @@ sys.exit(0 if ok else 1)
 EOF
 check "sync_smb_acl.py exits 0" "${COMPOSE[@]}" run --rm --no-deps sync-smb-acl
 
+crawl_with_failing_share() {
+  local out rc
+  out=$("${COMPOSE[@]}" run --rm --no-deps -e SHARES_CONFIG=/tests/shares-with-failure.yaml crawl-smb 2>&1)
+  rc=$?
+  echo "$out" | grep -E "^(finished|  finished|  failed|[0-9]+ share)" | sed 's/^/     /'
+  [ "$rc" -ne 0 ] && echo "$out" | grep -q "1 share(s) failed: test-missing" \
+    && echo "$out" | grep -q "finished 'test-finance'"
+}
+check "a failed share makes the crawl exit non-zero, other shares still crawled" crawl_with_failing_share
+
 echo "== status page"
 STATUS=http://localhost:18090
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }

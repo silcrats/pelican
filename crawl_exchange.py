@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait, as_completed
 from datetime import datetime, timezone
@@ -539,6 +540,11 @@ def run() -> None:
     state_db.close()
     print(f"Total indexed across all mailboxes: {grand_total}")
     status.job_finished()
+    # Non-zero exit so the scheduler and monitoring see the failure; the
+    # status page shows which mailbox and why.
+    failed = status.failed_sources()
+    if failed:
+        sys.exit(f"{len(failed)} mailbox(s) failed: {', '.join(failed)}")
 
 
 if __name__ == "__main__":
