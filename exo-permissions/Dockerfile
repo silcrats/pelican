@@ -1,6 +1,6 @@
 # Exchange Online permission exporter: PowerShell 7 + the Exchange Online module.
 # Kept separate from the crawler image so PowerShell (large) isn't in every crawler.
-FROM ubuntu:24.04
+FROM ubuntu:24.10
 
 # PowerShell from its GitHub release, checked against the SHA-256 published in
 # the release notes. Not mcr.microsoft.com/powershell: those images are no
