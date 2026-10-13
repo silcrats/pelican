@@ -55,7 +55,7 @@ echo "== build"
 "${COMPOSE[@]}" build opensearch-certs status || exit 1
 
 echo "== start OpenSearch, accounts, status page, Samba"
-"${COMPOSE[@]}" up -d --no-build status samba || { "${COMPOSE[@]}" logs; exit 1; }
+"${COMPOSE[@]}" up -d --no-build status samba samba-encrypted || { "${COMPOSE[@]}" logs; exit 1; }
 "${COMPOSE[@]}" logs opensearch-users | grep -E '\[(users|snapshots)\]'
 
 echo "== crawler account"
@@ -66,9 +66,11 @@ check "crawler account can do a crawl's operations, and no more" \
 echo "== SMB crawl"
 check "crawl_smb.py exits 0" "${COMPOSE[@]}" run --rm --no-deps crawl-smb
 os_admin -XPOST https://localhost:9200/documents/_refresh >/dev/null
-os_admin "https://localhost:9200/documents/_search?size=20" \
-  -d '{"query": {"term": {"share": "test-finance"}}}' > "$HITS"
-check "each fixture indexed with its text and access roles" python3 - "$HITS" <<'EOF'
+
+fixtures_indexed() {  # fixtures_indexed <share name>
+  os_admin "https://localhost:9200/documents/_search?size=20" \
+    -d "{\"query\": {\"term\": {\"share\": \"$1\"}}}" > "$HITS"
+  python3 - "$HITS" <<'EOF'
 import json, sys
 hits = {h["_source"]["filename"]: h["_source"] for h in json.load(open(sys.argv[1]))["hits"]["hits"]}
 expected = {"notes.txt": "Pelican plain text fixture", "report.docx": "Pelican Word fixture",
@@ -76,7 +78,8 @@ expected = {"notes.txt": "Pelican plain text fixture", "report.docx": "Pelican W
 ok = True
 for name, phrase in expected.items():
     doc = hits.get(name)
-    good = bool(doc) and phrase in doc.get("content", "") and bool(doc.get("role"))
+    # Roles from a real ACL read, not the fail-closed fallback (Radmin).
+    good = bool(doc) and phrase in doc.get("content", "") and doc.get("role") not in (None, [], ["Radmin"])
     print(f"     {name}: {'indexed' if doc else 'MISSING'}"
           + (f", roles {doc['role']}, text {'found' if phrase in doc.get('content', '') else 'MISSING'}" if doc else ""))
     ok &= good
@@ -84,6 +87,18 @@ if "skip.zip" in hits:
     print("     skip.zip: indexed although excluded"); ok = False
 sys.exit(0 if ok else 1)
 EOF
+}
+check "Samba on default settings: each fixture indexed with its text and ACL roles" fixtures_indexed test-finance
+check "Samba requiring encryption, share with encrypt: true: each fixture indexed" fixtures_indexed test-encrypted
+# Otherwise the check above proves nothing: a client that can't encrypt
+# (SMB 2.1) must be refused by samba-encrypted.
+encryption_enforced() {
+  local out   # captured first: smbclient exits non-zero when refused, which pipefail would count
+  out=$("${COMPOSE[@]}" run --rm --no-deps --entrypoint smbclient crawl-smb //samba-encrypted/Shared \
+    -U 'pelican-test%Smb-Test-Pw-1' -m SMB2_10 -c ls 2>&1)
+  grep -q NT_STATUS_ACCESS_DENIED <<< "$out"
+}
+check "test server refuses unencrypted (SMB 2.1) clients" encryption_enforced
 check "sync_smb_acl.py exits 0" "${COMPOSE[@]}" run --rm --no-deps sync-smb-acl
 
 crawl_with_failing_share() {
@@ -91,15 +106,15 @@ crawl_with_failing_share() {
   out=$("${COMPOSE[@]}" run --rm --no-deps -e SHARES_CONFIG=/tests/shares-with-failure.yaml crawl-smb 2>&1)
   rc=$?
   echo "$out" | grep -E "^(finished|  finished|  failed|[0-9]+ share)" | sed 's/^/     /'
-  [ "$rc" -ne 0 ] && echo "$out" | grep -q "1 share(s) failed: test-missing" \
-    && echo "$out" | grep -q "finished 'test-finance'"
+  [ "$rc" -ne 0 ] && grep -q "1 share(s) failed: test-missing" <<< "$out" \
+    && grep -q "finished 'test-finance'" <<< "$out"
 }
 check "a failed share makes the crawl exit non-zero, other shares still crawled" crawl_with_failing_share
 
 echo "== status page"
 STATUS=http://localhost:18090
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
-status_lists_job() { curl -s -u "pelican:$STATUS_PW" "$STATUS/status.json" | grep -q test-finance; }
+status_lists_job() { grep -q test-finance <<< "$(curl -s -u "pelican:$STATUS_PW" "$STATUS/status.json")"; }
 status_reads_index() {
   curl -s -u "pelican:$STATUS_PW" "$STATUS/storage.json" | python3 -c '
 import json, sys
@@ -117,10 +132,12 @@ anonymous_refused() {
   test "$("${COMPOSE[@]}" exec -T opensearch curl -sk -o /dev/null -w '%{http_code}' \
     https://localhost:9200/documents/_search)" = 401
 }
-policy_registered() { os_admin https://localhost:9200/_plugins/_sm/policies/pelican-daily | grep -q pelican-backups; }
+policy_registered() { grep -q pelican-backups <<< "$(os_admin https://localhost:9200/_plugins/_sm/policies/pelican-daily)"; }
 snapshot_works() {
-  os_admin -XPUT 'https://localhost:9200/_snapshot/pelican-backups/itest?wait_for_completion=true' \
-    -d '{"indices": "documents"}' | grep -q '"state":"SUCCESS"'
+  local out
+  out=$(os_admin -XPUT 'https://localhost:9200/_snapshot/pelican-backups/itest?wait_for_completion=true' \
+    -d '{"indices": "documents"}')
+  grep -q '"state":"SUCCESS"' <<< "$out" || { echo "     $out" | cut -c1-300; return 1; }
 }
 check "anonymous requests refused" anonymous_refused
 check "snapshot policy registered" policy_registered

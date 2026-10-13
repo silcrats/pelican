@@ -11,15 +11,12 @@ search UI built for it.
 
 ## Features
 
-- **SMB** via pysmb (no host mounts): parallel fetch, incremental by
+- **SMB** 2.0.2 to 3.1.1 via smbprotocol (no host mounts), with Windows file
+  servers, Samba and NAS devices: parallel fetch, incremental by
   modification time, deletion detection with guards against wiping a share
   on a bad listing, and per-folder ACLs via `smbcacls` with a separate job that
-  re-applies permission changes without re-downloading anything.
-  Works with Windows file servers. **Samba servers (including most NAS
-  devices) on their default settings refuse the connection** ("Server does
-  not support any of the pysmb dialects"): pysmb opens with an SMB1-format
-  negotiation, which Samba ignores unless `server min protocol = NT1`, and
-  that setting also allows SMB1 sessions.
+  re-applies permission changes without re-downloading anything. Traffic is
+  signed; set `encrypt: true` on a share to require SMB3 encryption.
 - **Exchange Online** via Microsoft Graph delta queries: full MIME per message,
   attachment text, Full Access holders mapped to AD accounts.
 - **SharePoint Online** via Graph with `Sites.Selected` (only the sites you

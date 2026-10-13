@@ -1,5 +1,6 @@
-# SMB config for the integration test: the test Samba server's read-only
-# share. Same exclusions as config/shares.yaml for the extensions tested.
+# SMB config for the integration test: the test Samba servers' read-only
+# shares, one of them encrypted. Same exclusions as config/shares.yaml for
+# the extensions tested.
 exclude_extensions: [zip]
 exclude_no_extension: true
 default_credentials:
@@ -11,3 +12,8 @@ shares:
     server: samba
     share: Shared
     path: 'Finance'
+  - name: test-encrypted
+    server: samba-encrypted
+    share: Shared
+    path: 'Finance'
+    encrypt: true

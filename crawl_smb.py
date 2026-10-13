@@ -4,8 +4,8 @@ shared index (see pelican/index.py for the document schema).
 
 Two things needed to scale from ~600K files to millions:
   1. Concurrency: files are fetched in parallel via a thread pool, one
-     persistent SMB connection per worker thread (pysmb connections aren't
-     safe to share across threads).
+     persistent SMB connection per worker thread (see pelican/smb_client.py;
+     a connection isn't shared across threads).
   2. Incremental runs: the state DB (pelican/state.py) tracks each file's
      last-modified time. On repeat runs, unchanged files are skipped
      entirely -- no download, no extraction, no OpenSearch write.
@@ -18,8 +18,8 @@ access without re-downloading them. This crawler's only part in it is
 record_new_acl_groups(): registering each directory it walks (and forgetting
 ones that are gone) so that container knows what to check.
 
-A file deleted from the share is also never reported as such by pysmb's
-listPath -- it just stops appearing. See remove_deleted_files(): unlike the
+A file deleted from the share is also never reported as such by a
+directory listing -- it just stops appearing. See remove_deleted_files(): unlike the
 Exchange/SharePoint crawlers (which get told about deletions via a Graph delta
 feed), this diffs each run's complete listing against everything the state DB
 previously knew about that share, so it needs a full, uninterrupted walk to be
@@ -34,36 +34,35 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait, as_completed
-from io import BytesIO
 from pathlib import Path
-
-from smb.SMBConnection import SMBConnection
 
 from pelican import roles as role_store
 from pelican import settings, smb_shares, state, status
 from pelican.extract_text import extract_text
 from pelican.index import build_doc, bulk_index, delete_docs, ensure_index_exists
 from pelican.smb_acl import ACL_ROLES_TABLE, AclLookupProblem, acl_group_key, roles_for_acl_group, roles_for_path
+from pelican.smb_client import SmbShareClient
 from pelican.watchdog import heartbeat, start_watchdog
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "50"))
 SMB_WORKERS = int(os.environ.get("SMB_WORKERS", "8"))
 EMPTY_LISTING_RETRY_DELAY_SECONDS = int(os.environ.get("EMPTY_LISTING_RETRY_DELAY_SECONDS", "5"))
-# pysmb's own operation timeouts, passed explicitly rather than relying on its
-# library defaults -- a NAS that accepts the TCP connection but then never
-# answers a specific request (a silent network drop, not a clean error) has been
-# observed hanging a crawl indefinitely with no exception and no way to notice.
-# (Connect timeout: SMB_CONNECT_TIMEOUT_SECONDS, see pelican/smb_shares.py.)
+# How long to wait for the server's answer to each SMB request, rather than
+# relying on library defaults -- a NAS that accepts the TCP connection but then
+# never answers a specific request (a silent network drop, not a clean error)
+# has been observed hanging a crawl indefinitely with no exception and no way to
+# notice. (Connect timeout: SMB_CONNECT_TIMEOUT_SECONDS, see pelican/smb_shares.py.)
 SMB_LIST_TIMEOUT_SECONDS = int(os.environ.get("SMB_LIST_TIMEOUT_SECONDS", "60"))
-# Generous compared to listing: a large legitimate file on a slow link should
-# not be mistaken for a hang the way an unresponsive directory listing would be.
+# Generous compared to listing. Applies to each 1 MiB read request, so a large
+# file on a slow link isn't mistaken for a hang.
 SMB_FETCH_TIMEOUT_SECONDS = int(os.environ.get("SMB_FETCH_TIMEOUT_SECONDS", "300"))
-# Belt-and-braces on top of SMB_LIST_TIMEOUT_SECONDS: observed in practice, a
-# listPath call passed an explicit timeout can still block indefinitely against
-# an unresponsive NAS (CPU pinned at 0%, no progress, no exception, for many
-# minutes) -- so pysmb's own timeout handling can't be trusted alone here. This
-# is the actual backstop: how long with NO new item at all from the listing
-# before giving up on it outright. See walk_smb_files_watchdog().
+# Belt-and-braces on top of SMB_LIST_TIMEOUT_SECONDS: observed in practice
+# (with the earlier SMB library), a listing passed an explicit timeout can still
+# block indefinitely against an unresponsive NAS (CPU pinned at 0%, no
+# progress, no exception, for many minutes) -- so per-request timeouts aren't
+# trusted alone here. This is the actual backstop: how long with NO new item at
+# all from the listing before giving up on it outright. See
+# walk_smb_files_watchdog().
 SMB_LIST_STALL_SECONDS = int(os.environ.get("SMB_LIST_STALL_SECONDS", "120"))
 
 _config = smb_shares.config()
@@ -76,34 +75,46 @@ DEFAULT_EXCLUDE_NO_EXTENSION = _config.get("exclude_no_extension", False)
 PROPAGATE_DELETES = bool(_config.get("propagate_deletes", True))
 
 _thread_local = threading.local()
+# Every worker connection opened for the current share, closed when it's done.
+_worker_connections: list[SmbShareClient] = []
+_worker_connections_lock = threading.Lock()
 
 
-def get_worker_connection(share: dict) -> SMBConnection:
-    """One persistent connection per worker thread, created lazily and reused."""
+def get_worker_connection(share: dict) -> SmbShareClient:
+    """One persistent connection per worker thread, created lazily and reused.
+    Worker threads live for one share (process_share's executor), so each
+    connection is to that share."""
     if not hasattr(_thread_local, "conn"):
         _thread_local.conn = smb_shares.connect(share)
+        with _worker_connections_lock:
+            _worker_connections.append(_thread_local.conn)
     return _thread_local.conn
 
 
-def walk_smb_files(conn: SMBConnection, share_name: str, smb_path: str):
+def close_worker_connections() -> None:
+    with _worker_connections_lock:
+        for conn in _worker_connections:
+            conn.close()
+        _worker_connections.clear()
+
+
+def walk_smb_files(conn: SmbShareClient, smb_path: str):
     """Lazily yield (share-relative SMB path, last_write_time) for every
     file under smb_path. Listing only -- nothing downloaded here."""
-    for entry in conn.listPath(share_name, smb_path or "/", timeout=SMB_LIST_TIMEOUT_SECONDS):
-        if entry.filename in (".", ".."):
-            continue
-        entry_smb_path = f"{smb_path}\\{entry.filename}" if smb_path else entry.filename
-        if entry.isDirectory:
-            yield from walk_smb_files(conn, share_name, entry_smb_path)
+    for name, is_directory, last_write_time in conn.list_dir(smb_path, timeout=SMB_LIST_TIMEOUT_SECONDS):
+        entry_smb_path = f"{smb_path}\\{name}" if smb_path else name
+        if is_directory:
+            yield from walk_smb_files(conn, entry_smb_path)
         else:
-            yield entry_smb_path, entry.last_write_time
+            yield entry_smb_path, last_write_time
 
 
-def _walk_smb_files_producer(conn: SMBConnection, share_name: str, root_path: str, out: queue.Queue) -> None:
+def _walk_smb_files_producer(conn: SmbShareClient, root_path: str, out: queue.Queue) -> None:
     """Runs walk_smb_files to completion on a background thread, forwarding
     every item (or the terminal error/done marker) onto `out`. See
     walk_smb_files_watchdog for why this exists."""
     try:
-        for item in walk_smb_files(conn, share_name, root_path):
+        for item in walk_smb_files(conn, root_path):
             out.put(("item", item))
     except Exception as exc:
         out.put(("error", exc))
@@ -111,16 +122,16 @@ def _walk_smb_files_producer(conn: SMBConnection, share_name: str, root_path: st
         out.put(("done", None))
 
 
-def walk_smb_files_watchdog(conn: SMBConnection, share_name: str, root_path: str, stall_seconds: float):
+def walk_smb_files_watchdog(conn: SmbShareClient, share_name: str, root_path: str, stall_seconds: float):
     """Like walk_smb_files, but gives up if NOTHING new arrives (not even one
     more file, or the listing finishing) within stall_seconds -- protection
-    against a hang inside pysmb or the underlying socket that its own
-    documented per-call timeout parameters don't reliably catch.
+    against a hang inside the SMB library or the underlying socket that
+    per-request timeouts don't reliably catch.
 
     Does this by running the real walk on a background daemon thread and
     reading its results off a queue with a timeout on each read, rather than
     iterating it directly -- queue.Queue.get(timeout=...) is enforced by
-    Python itself, not by whatever pysmb/the socket happens to be doing, so it
+    Python itself, not by whatever the SMB library/socket is doing, so it
     can't be defeated the same way.
 
     If it gives up, the background thread is simply abandoned, not joined --
@@ -128,14 +139,14 @@ def walk_smb_files_watchdog(conn: SMBConnection, share_name: str, root_path: str
     having given up on this one share), the whole container exits and Python
     kills any daemon thread outright, stuck or not."""
     q: queue.Queue = queue.Queue(maxsize=1000)
-    threading.Thread(target=_walk_smb_files_producer, args=(conn, share_name, root_path, q), daemon=True).start()
+    threading.Thread(target=_walk_smb_files_producer, args=(conn, root_path, q), daemon=True).start()
     while True:
         try:
             kind, payload = q.get(timeout=stall_seconds)
         except queue.Empty:
             raise TimeoutError(
                 f"no progress listing '{share_name}' for {stall_seconds:.0f}s -- the SMB connection "
-                f"appears to have hung (pysmb's own per-call timeout apparently didn't catch this)"
+                f"appears to have hung (its per-request timeout apparently didn't catch this)"
             )
         if kind == "done":
             return
@@ -148,9 +159,7 @@ def fetch_one(share: dict, smb_relative_path: str) -> tuple[str, str, list[str],
     """Runs in a worker thread. Returns (filename, extracted_text, roles, raw_size, meta, acl_group)."""
     conn = get_worker_connection(share)
     filename = smb_relative_path.split("\\")[-1]
-    buf = BytesIO()
-    conn.retrieveFile(share["share"], smb_relative_path.replace("\\", "/"), buf, timeout=SMB_FETCH_TIMEOUT_SECONDS)
-    data = buf.getvalue()
+    data = conn.read_file(smb_relative_path, timeout=SMB_FETCH_TIMEOUT_SECONDS)
     full_path = f"{share['server']}\\{share['share']}\\{smb_relative_path}"
     text, meta = extract_text(full_path, data)
     doc_roles = roles_for_path(share, smb_relative_path)
@@ -219,7 +228,7 @@ def previously_known_urls(share: dict, state_db: sqlite3.Connection) -> set[str]
 def remove_deleted_files(share: dict, seen: set[str], previously_known: set[str],
                           state_db: sqlite3.Connection) -> int:
     """Removes documents from the index whose file no longer exists on the
-    share. pysmb's listPath has no "tell me what changed" mode -- it's a full
+    share. An SMB directory listing has no "tell me what changed" mode -- it's a full
     directory listing every run -- so this is detected by diffing this run's
     complete set of discovered files (`seen`, everything walk_smb_files
     yielded, regardless of extension exclusion or whether the content itself
@@ -233,7 +242,7 @@ def remove_deleted_files(share: dict, seen: set[str], previously_known: set[str]
     never reached for that run -- an incomplete listing must never be treated
     as "everything else was deleted".
 
-    That guard isn't enough on its own, though: listPath can also come back
+    That guard isn't enough on its own, though: a listing can also come back
     completely EMPTY without raising anything -- a NAS blip, a permissions
     change, a mistyped path -- and that's indistinguishable, from here, from
     every file genuinely having been deleted in one run. process_share already
@@ -298,7 +307,7 @@ def process_share(share: dict, state_db: sqlite3.Connection) -> int:
 
     # Retried once (fresh connection) if a share that previously had content
     # discovers nothing at all -- see remove_deleted_files' docstring for why:
-    # a NAS blip or transient server-side issue can make listPath come back
+    # a NAS blip or transient server-side issue can make a listing come back
     # completely empty without raising anything, indistinguishable up to this
     # point from every file genuinely being gone. A retry lets the crawl
     # self-heal within the same run instead of just avoiding the worse outcome
@@ -312,54 +321,57 @@ def process_share(share: dict, state_db: sqlite3.Connection) -> int:
         seen: set[str] = set()   # every file's url discovered this run, regardless of
                                   # exclusion/unchanged status -- see remove_deleted_files()
 
-        with ThreadPoolExecutor(max_workers=SMB_WORKERS) as executor:
-            in_flight: dict = {}
-            max_in_flight = SMB_WORKERS * 4
-            last_report = time.time()
+        try:
+            with ThreadPoolExecutor(max_workers=SMB_WORKERS) as executor:
+                in_flight: dict = {}
+                max_in_flight = SMB_WORKERS * 4
+                last_report = time.time()
 
-            for smb_relative_path, mtime in walk_smb_files_watchdog(
-                    lister_conn, share["share"], share.get("path", ""), SMB_LIST_STALL_SECONDS):
-                discovered += 1
-                if time.time() - last_report > 3:
-                    heartbeat(f"discovering '{share['name']}' ({discovered} so far)")
-                    print(f"  [diag] discovered {discovered} files so far, {len(in_flight)} in flight, {total_indexed} indexed")
-                    status.share_progress(share["name"], discovered, total_indexed, skipped_excluded,
-                                           skipped_unchanged, extraction_timeouts)
-                    last_report = time.time()
+                for smb_relative_path, mtime in walk_smb_files_watchdog(
+                        lister_conn, share["share"], share.get("path", ""), SMB_LIST_STALL_SECONDS):
+                    discovered += 1
+                    if time.time() - last_report > 3:
+                        heartbeat(f"discovering '{share['name']}' ({discovered} so far)")
+                        print(f"  [diag] discovered {discovered} files so far, {len(in_flight)} in flight, {total_indexed} indexed")
+                        status.share_progress(share["name"], discovered, total_indexed, skipped_excluded,
+                                               skipped_unchanged, extraction_timeouts)
+                        last_report = time.time()
 
-                # Both tracked for every file (even excluded/unchanged ones), computed
-                # before any `continue` below: acl_groups_seen is how
-                # record_new_acl_groups() finds every directory the ACL container should
-                # know about (a permission change never shows up as a "changed" file to
-                # skip past), and seen is how remove_deleted_files()
-                # tells "still on the share, just not re-indexed this run" apart from
-                # "gone" -- excluding a file by extension must not make it look deleted.
-                acl_groups_seen.add(acl_group_key(share, smb_relative_path))
-                url = smb_shares.smb_url(share, smb_relative_path)
-                seen.add(url)
+                    # Both tracked for every file (even excluded/unchanged ones), computed
+                    # before any `continue` below: acl_groups_seen is how
+                    # record_new_acl_groups() finds every directory the ACL container should
+                    # know about (a permission change never shows up as a "changed" file to
+                    # skip past), and seen is how remove_deleted_files()
+                    # tells "still on the share, just not re-indexed this run" apart from
+                    # "gone" -- excluding a file by extension must not make it look deleted.
+                    acl_groups_seen.add(acl_group_key(share, smb_relative_path))
+                    url = smb_shares.smb_url(share, smb_relative_path)
+                    seen.add(url)
 
-                filename = smb_relative_path.split("\\")[-1]
-                ext = Path(filename).suffix.lstrip(".").lower()
-                if (ext and ext in exclude_extensions) or (not ext and exclude_no_extension):
-                    skipped_excluded += 1
-                    continue
+                    filename = smb_relative_path.split("\\")[-1]
+                    ext = Path(filename).suffix.lstrip(".").lower()
+                    if (ext and ext in exclude_extensions) or (not ext and exclude_no_extension):
+                        skipped_excluded += 1
+                        continue
 
-                if state.is_unchanged(state_db, url, mtime):
-                    skipped_unchanged += 1
-                    continue
+                    if state.is_unchanged(state_db, url, mtime):
+                        skipped_unchanged += 1
+                        continue
 
-                future = executor.submit(fetch_one, share, smb_relative_path)
-                in_flight[future] = (smb_relative_path, mtime, url)
+                    future = executor.submit(fetch_one, share, smb_relative_path)
+                    in_flight[future] = (smb_relative_path, mtime, url)
 
-                if len(in_flight) >= max_in_flight:
-                    done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
-                    for f in done:
-                        handle_result(f, *in_flight.pop(f))
+                    if len(in_flight) >= max_in_flight:
+                        done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+                        for f in done:
+                            handle_result(f, *in_flight.pop(f))
 
-            for f in as_completed(in_flight):
-                handle_result(f, *in_flight[f])
-
-        lister_conn.close()
+                for f in as_completed(in_flight):
+                    handle_result(f, *in_flight[f])
+        finally:
+            # Also on an error, so a failed share doesn't leave connections open.
+            lister_conn.close()
+            close_worker_connections()
 
         if discovered > 0 or not known_before or attempt == 2:
             break

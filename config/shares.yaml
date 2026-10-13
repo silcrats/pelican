@@ -44,7 +44,7 @@ default_credentials:
   pass_env: SMB_PASS
   domain_env: SMB_DOMAIN
 
-# One entry per share/folder to crawl. Pelican connects directly via pysmb --
+# One entry per share/folder to crawl. Pelican connects directly over SMB2/3 --
 # no host mount needed.
 #
 #   name:    unique source name (becomes the "Source" in search, the `share`
@@ -55,6 +55,9 @@ default_credentials:
 #            to the share root. "" crawls the entire share.
 #   user_env / pass_env / domain_env: override default_credentials.
 #   exclude_extensions / exclude_no_extension: override the globals above.
+#   encrypt: true -- refuse to crawl this share unencrypted (needs SMB 3;
+#            Windows Server 2012+ and current Samba). Without it, traffic is
+#            signed, and encrypted only when the server requires it.
 #   acl_scope: "directory" (default) -- one cached ACL lookup per folder,
 #            assuming files inherit their folder's ACL; or "file" -- exact
 #            per-file lookups for shares with per-file permission overrides

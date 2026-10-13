@@ -11,23 +11,31 @@ services:
       - ./tests/integration:/tests:ro
       - smb-data:/out
 
+  # Samba on its default settings (SMB2 minimum).
   samba:
     image: dockurr/samba:4.23.10
-    # pysmb always opens with an SMB1-format negotiate offering SMB2, which
-    # Windows answers but Samba ignores unless it accepts SMB1 negotiation.
-    # The session itself still uses SMB2.
-    entrypoint: ["/sbin/tini", "--", "sh", "-c",
-                 "sed -i 's/server min protocol = SMB2/server min protocol = NT1/' /etc/samba/smb.default && exec /usr/bin/samba.sh"]
-    environment:
+    environment: &samba-env
       USER: pelican-test
       PASS: Smb-Test-Pw-1
       RW: "false"
     volumes:
       - smb-data:/storage
     networks: [search]
-    depends_on:
+    depends_on: &after-fixtures
       smb-fixtures:
         condition: service_completed_successfully
+
+  # Same files, but the server refuses unencrypted sessions (SMB3 encryption
+  # required); crawled through a share with `encrypt: true`.
+  samba-encrypted:
+    image: dockurr/samba:4.23.10
+    entrypoint: ["/sbin/tini", "--", "sh", "-c",
+                 "sed -i 's/^\\[global\\]/[global]\\n    server smb encrypt = required/' /etc/samba/smb.default && exec /usr/bin/samba.sh"]
+    environment: *samba-env
+    volumes:
+      - smb-data:/storage
+    networks: [search]
+    depends_on: *after-fixtures
 
   # Its own name and port, so the test can run next to a real deployment.
   status:

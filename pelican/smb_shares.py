@@ -11,14 +11,11 @@ Pelican's SMB helpers needs a shares.yaml to exist.
 import os
 from functools import lru_cache
 
-from smb.SMBConnection import SMBConnection
-
 from . import settings
+from .smb_client import SmbShareClient
 
 SHARES_CONFIG_PATH = settings.config_path("SHARES_CONFIG", "shares.yaml")
 SMB_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("SMB_CONNECT_TIMEOUT_SECONDS", "30"))
-# NetBIOS name this client announces to the server.
-SMB_CLIENT_NAME = os.environ.get("SMB_CLIENT_NAME", "pelican")
 
 
 @lru_cache(maxsize=None)
@@ -57,13 +54,13 @@ def credentials(share: dict) -> tuple[str, str, str]:
     return os.environ[user_env], os.environ[pass_env], (os.environ.get(domain_env, "") if domain_env else "")
 
 
-def connect(share: dict) -> SMBConnection:
+def connect(share: dict) -> SmbShareClient:
+    """A connection to the share over SMB2/3. With `encrypt: true` in the
+    share's entry, refuses to work unencrypted (needs SMB 3)."""
     user, password, domain = credentials(share)
-    conn = SMBConnection(user, password, SMB_CLIENT_NAME, share["server"],
-                         domain=domain, use_ntlm_v2=True, is_direct_tcp=True)
-    if not conn.connect(share["server"], 445, timeout=SMB_CONNECT_TIMEOUT_SECONDS):
-        raise ConnectionError(f"Failed to connect to {share['server']}")
-    return conn
+    return SmbShareClient(share["server"], share["share"], user, password, domain,
+                          encrypt=bool(share.get("encrypt", False)),
+                          connect_timeout=SMB_CONNECT_TIMEOUT_SECONDS)
 
 
 def smb_url(share: dict, smb_relative_path: str) -> str:

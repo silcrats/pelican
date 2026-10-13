@@ -60,8 +60,10 @@ def _query_acl_raising(share: dict, smb_path: str) -> list[str]:
     auth = f"{domain}\\{user}%{password}" if domain else f"{user}%{password}"
 
     try:
+        # A share with `encrypt: true` gets its ACL lookups encrypted too.
+        protection = ["--client-protection=encrypt"] if share.get("encrypt") else []
         result = subprocess.run(
-            ["smbcacls", target, smb_path, "-U", auth],
+            ["smbcacls", target, smb_path, "-U", auth, *protection],
             capture_output=True, text=True, check=True, timeout=15,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
