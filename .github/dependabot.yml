@@ -15,8 +15,11 @@ updates:
     ignore:
       - dependency-name: python
         update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      # Ubuntu LTS moves (24.04 -> 26.04) count as major and stay manual; the
+      # interim releases between them (24.10, 25.04, ...) count as minor and
+      # are supported for only nine months, so they're never wanted.
       - dependency-name: ubuntu
-        update-types: ["version-update:semver-major"]
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
   # PowerShell in exo-permissions is installed from a release file
   # (PWSH_VERSION / PWSH_SHA256 in its Dockerfile): update it by hand.
 
