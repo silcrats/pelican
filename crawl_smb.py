@@ -38,7 +38,7 @@ from pathlib import Path
 
 from pelican import roles as role_store
 from pelican import settings, smb_shares, state, status
-from pelican.extract_text import extract_text
+from pelican.extract_text import EXTRACTION_REVISIONS, extract_text
 from pelican.index import build_doc, bulk_index, delete_docs, ensure_index_exists
 from pelican.smb_acl import ACL_ROLES_TABLE, AclLookupProblem, acl_group_key, roles_for_acl_group, roles_for_path
 from pelican.smb_client import SmbShareClient
@@ -263,7 +263,7 @@ def remove_deleted_files(share: dict, seen: set[str], previously_known: set[str]
     return len(to_delete)
 
 
-def process_share(share: dict, state_db: sqlite3.Connection) -> int:
+def process_share(share: dict, state_db: sqlite3.Connection, reextract_cutoffs: dict[str, float]) -> int:
     status.share_started(share["name"])
     heartbeat(f"started '{share['name']}'")
     known_before = previously_known_urls(share, state_db)
@@ -354,7 +354,7 @@ def process_share(share: dict, state_db: sqlite3.Connection) -> int:
                         skipped_excluded += 1
                         continue
 
-                    if state.is_unchanged(state_db, url, mtime):
+                    if state.is_unchanged(state_db, url, mtime, reextract_cutoffs.get(ext)):
                         skipped_unchanged += 1
                         continue
 
@@ -409,6 +409,7 @@ def run() -> None:
     ensure_index_exists()
     state_db = state.init_state_db()
     role_store.init_roles_table(state_db, ACL_ROLES_TABLE)
+    reextract_cutoffs, _ = state.extraction_cutoffs(state_db, EXTRACTION_REVISIONS)
     status.job_started(
         [s["name"] for s in SHARES],
         smb_workers=SMB_WORKERS,
@@ -420,7 +421,7 @@ def run() -> None:
     for share in SHARES:
         print(f"Processing share '{share['name']}' from {share['server']}/{share['share']}")
         try:
-            count = process_share(share, state_db)
+            count = process_share(share, state_db, reextract_cutoffs)
             grand_total += count
             status.share_finished(share["name"], count)
             print(f"  finished '{share['name']}': {count} documents indexed")

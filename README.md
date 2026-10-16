@@ -22,7 +22,8 @@ search UI built for it.
 - **SharePoint Online** via Graph with `Sites.Selected` (only the sites you
   grant): delta queries per library, extension whitelist, site group members
   mirrored as access.
-- **Text extraction** for PDF (isolated, with a timeout), DOCX, EML/MSG
+- **Text extraction** for PDF (isolated, with a timeout), DOCX, Word and
+  PowerPoint 97-2003 (DOC, PPT, including speaker notes), EML/MSG
   (including attachments) and plain text; EXIF camera and GPS data for images,
   reverse-geocoded offline.
 - **Fail-closed access**: if permissions can't be read, new content is

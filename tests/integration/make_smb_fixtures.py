@@ -6,6 +6,7 @@ looks for in the index. Run in the crawler image (it has python-docx).
   python make_smb_fixtures.py <dir>
 """
 
+import gzip
 import os
 import sys
 
@@ -16,6 +17,13 @@ EXPECTED = {
     "Finance/report.docx": "Pelican Word fixture",
     "Finance/scan.pdf": "Pelican PDF fixture",
 }
+# Word/PowerPoint 97-2003 files, made with LibreOffice (they can't be
+# generated here), stored gzipped in fixtures/.
+LEGACY = {
+    "Finance/legacy-word.doc": "Ελληνικά 中文",
+    "Finance/legacy-powerpoint.ppt": "secret word walrus",   # from the speaker notes
+}
+FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 
 def write_pdf(path: str, text: str) -> None:
@@ -56,10 +64,15 @@ def main(root: str) -> None:
         else:
             write_pdf(path, text)
         os.chmod(path, 0o644)
+    for rel in LEGACY:
+        path = os.path.join(root, rel)
+        with gzip.open(os.path.join(FIXTURES_DIR, os.path.basename(rel) + ".gz")) as src, open(path, "wb") as out:
+            out.write(src.read())
+        os.chmod(path, 0o644)
     # Excluded by config/shares.yaml's exclude_extensions: must not be indexed.
     with open(os.path.join(root, "Finance", "skip.zip"), "wb") as f:
         f.write(b"PK\x05\x06" + b"\0" * 18)
-    print(f"wrote {len(EXPECTED) + 1} files under {root}/Finance")
+    print(f"wrote {len(EXPECTED) + len(LEGACY) + 1} files under {root}/Finance")
 
 
 if __name__ == "__main__":

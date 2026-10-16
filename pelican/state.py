@@ -31,13 +31,43 @@ def init_state_db(path: str | None = None) -> sqlite3.Connection:
             indexed_at REAL
         )
     """)
+    # When this database first saw each extraction revision (see
+    # extraction_cutoffs).
+    db.execute("CREATE TABLE IF NOT EXISTS extraction_revisions (revision TEXT PRIMARY KEY, first_seen REAL)")
     db.commit()
     return db
 
 
-def is_unchanged(db: sqlite3.Connection, key: str, mtime: float) -> bool:
-    row = db.execute("SELECT last_modified FROM file_state WHERE smb_url = ?", (key,)).fetchone()
-    return row is not None and row[0] == mtime
+def extraction_cutoffs(db: sqlite3.Connection, revisions: dict[str, set[str]]) -> tuple[dict[str, float], bool]:
+    """For each extension an extraction revision covers, the time this
+    database first saw that revision: an item of that type indexed earlier
+    was extracted by the old code and is re-extracted once (pass the cutoff
+    to is_unchanged). Also returns whether any revision is new this run.
+    `revisions` maps a revision name to its extensions; see
+    extract_text.EXTRACTION_REVISIONS."""
+    now = time.time()
+    cutoffs: dict[str, float] = {}
+    new = False
+    for revision, extensions in revisions.items():
+        row = db.execute("SELECT first_seen FROM extraction_revisions WHERE revision = ?", (revision,)).fetchone()
+        if row is None:
+            db.execute("INSERT INTO extraction_revisions (revision, first_seen) VALUES (?, ?)", (revision, now))
+            first_seen, new = now, True
+        else:
+            first_seen = row[0]
+        for ext in extensions:
+            cutoffs[ext] = max(cutoffs.get(ext, 0.0), first_seen)
+    db.commit()
+    return cutoffs, new
+
+
+def is_unchanged(db: sqlite3.Connection, key: str, mtime: float, reextract_before: float | None = None) -> bool:
+    """Same modification time as when last indexed -- and, given
+    reextract_before (an extraction cutoff), indexed no earlier than that."""
+    row = db.execute("SELECT last_modified, indexed_at FROM file_state WHERE smb_url = ?", (key,)).fetchone()
+    if row is None or row[0] != mtime:
+        return False
+    return reextract_before is None or (row[1] or 0) >= reextract_before
 
 
 def record_indexed(db: sqlite3.Connection, key: str, mtime: float) -> None:

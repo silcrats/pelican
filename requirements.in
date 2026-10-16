@@ -1,6 +1,7 @@
 opensearch-py
 smbprotocol
 pyyaml
+olefile
 pypdfium2
 python-docx
 extract-msg

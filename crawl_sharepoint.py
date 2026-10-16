@@ -34,7 +34,7 @@ import requests
 
 from pelican import roles as role_store
 from pelican import settings, state, status
-from pelican.extract_text import extract_text
+from pelican.extract_text import EXTRACTION_REVISIONS, extract_text
 from pelican.graph_client import GraphClient
 from pelican.index import SEARCH_INDEX, build_doc, bulk_index, client, delete_docs, ensure_index_exists
 from pelican.watchdog import heartbeat, start_watchdog
@@ -325,7 +325,7 @@ def fetch_one(drive_id: str, item_id: str, filename: str, site_name: str) -> tup
     return text, email_meta, len(data)
 
 
-def process_site(cfg: dict, state_db: sqlite3.Connection) -> int:
+def process_site(cfg: dict, state_db: sqlite3.Connection, reextract_cutoffs: dict[str, float]) -> int:
     name = cfg["name"]
     status.share_started(name)
     heartbeat(f"started '{name}'")
@@ -398,7 +398,12 @@ def process_site(cfg: dict, state_db: sqlite3.Connection) -> int:
             for attempt in (1, 2):
                 row = get_delta(state_db, name, drive_id)
                 now = time.time()
-                if attempt == 1 and row and row[0] and (now - (row[1] or 0)) < FULL_RECRAWL_SECONDS:
+                # Incremental, unless a full listing is due, or extraction for some
+                # type changed since the last one (a delta listing wouldn't include
+                # the unchanged files that need extracting again).
+                reextract_since = max(reextract_cutoffs.values(), default=0.0)
+                if (attempt == 1 and row and row[0] and (now - (row[1] or 0)) < FULL_RECRAWL_SECONDS
+                        and (row[1] or 0) >= reextract_since):
                     url, full_crawl_at = row[0], row[1]                     # incremental
                 else:
                     url = f"{graph.endpoint}/drives/{quote(drive_id, safe='')}/root/delta"
@@ -443,7 +448,7 @@ def process_site(cfg: dict, state_db: sqlite3.Connection) -> int:
                             if since_epoch and mtime < since_epoch:
                                 skipped_excluded += 1
                                 continue
-                            if state.is_unchanged(state_db, state_key, mtime):
+                            if state.is_unchanged(state_db, state_key, mtime, reextract_cutoffs.get(ext)):
                                 skipped_unchanged += 1
                                 continue
 
@@ -499,6 +504,7 @@ def run() -> None:
     start_watchdog()
     ensure_index_exists()
     state_db = state.init_state_db()
+    reextract_cutoffs, _ = state.extraction_cutoffs(state_db, EXTRACTION_REVISIONS)
     init_tables(state_db)
     status.job_started(
         [s["name"] for s in SITES],
@@ -512,7 +518,7 @@ def run() -> None:
     for cfg in SITES:
         print(f"Processing site '{cfg['name']}' ({cfg['url']})")
         try:
-            count = process_site(cfg, state_db)
+            count = process_site(cfg, state_db, reextract_cutoffs)
             grand_total += count
             status.share_finished(cfg["name"], count)
             print(f"  finished '{cfg['name']}': {count} documents indexed")

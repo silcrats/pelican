@@ -74,7 +74,8 @@ fixtures_indexed() {  # fixtures_indexed <share name>
 import json, sys
 hits = {h["_source"]["filename"]: h["_source"] for h in json.load(open(sys.argv[1]))["hits"]["hits"]}
 expected = {"notes.txt": "Pelican plain text fixture", "report.docx": "Pelican Word fixture",
-            "scan.pdf": "Pelican PDF fixture"}
+            "scan.pdf": "Pelican PDF fixture", "legacy-word.doc": "Ελληνικά 中文",
+            "legacy-powerpoint.ppt": "secret word walrus"}
 ok = True
 for name, phrase in expected.items():
     doc = hits.get(name)
@@ -100,6 +101,26 @@ encryption_enforced() {
 }
 check "test server refuses unencrypted (SMB 2.1) clients" encryption_enforced
 check "sync_smb_acl.py exits 0" "${COMPOSE[@]}" run --rm --no-deps sync-smb-acl
+
+# Files indexed before an extractor was added are extracted again once:
+# make the .doc/.ppt look indexed by an older Pelican (backdated in the
+# state DB, no text in the index), crawl, and expect only those re-fetched.
+legacy_office_reextracted() {
+  local rewound out
+  rewound=$("${COMPOSE[@]}" run --rm --no-deps -e PYTHONPATH=/app --entrypoint python crawl-smb \
+    /tests/rewind_legacy_office.py 2>/dev/null | tail -1)
+  [ "$rewound" = 4 ] || { echo "     expected 4 state rows rewound, got '$rewound'"; return 1; }
+  os_admin -XPOST "https://localhost:9200/documents/_update_by_query?refresh=true" -d '{
+    "query": {"terms": {"filename.keyword": ["legacy-word.doc", "legacy-powerpoint.ppt"]}},
+    "script": {"source": "ctx._source.content = \u0027\u0027"}}' >/dev/null
+  out=$("${COMPOSE[@]}" run --rm --no-deps crawl-smb 2>&1)
+  grep -E "finished|skipped [0-9]+ unchanged" <<< "$out" | sed 's/^/     /'
+  [ "$(grep -c "finished 'test-[a-z]*': 2 documents indexed" <<< "$out")" = 2 ] \
+    && os_admin -XPOST https://localhost:9200/documents/_refresh >/dev/null \
+    && fixtures_indexed test-finance >/dev/null && fixtures_indexed test-encrypted >/dev/null
+}
+check "files indexed before .doc/.ppt extraction existed are extracted once, nothing else re-fetched" \
+  legacy_office_reextracted
 
 crawl_with_failing_share() {
   local out rc

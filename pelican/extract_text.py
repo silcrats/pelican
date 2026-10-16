@@ -14,6 +14,8 @@ from email import policy
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 
+from .extract_legacy_office import extract_doc, extract_ppt
+
 PDF_TIMEOUT_SECONDS = int(os.environ.get("PDF_TIMEOUT_SECONDS", "30"))
 
 
@@ -350,6 +352,17 @@ def _extract_msg(data: bytes) -> tuple[str, dict]:
         msg.close()
 
 
+# Word and PowerPoint 97-2003; see extract_legacy_office.py.
+_LEGACY_WORD_EXTENSIONS = {"doc", "dot"}
+_LEGACY_POWERPOINT_EXTENSIONS = {"ppt", "pps", "pot"}
+
+# When extraction for a type is added or improved, add an entry here: files
+# of these types indexed before a crawler first runs this code are fetched
+# and extracted again once, even though they haven't changed (see
+# state.extraction_cutoffs). Never rename or remove an entry.
+EXTRACTION_REVISIONS: dict[str, set[str]] = {
+    "2026-10-legacy-office": _LEGACY_WORD_EXTENSIONS | _LEGACY_POWERPOINT_EXTENSIONS,
+}
 _PLAIN_TEXT_EXTENSIONS = {"txt", "md", "csv", "log", "json", "xml", "html", "htm", "yaml", "yml", "ini", "conf"}
 _IMAGE_EXTENSIONS = {"jpg", "jpeg", "tif", "tiff", "png", "webp"}
 
@@ -381,6 +394,12 @@ def extract_text(path: str, data: bytes) -> tuple[str, dict]:
             return text, ({"extraction_timeout": True} if timed_out else {})
         if ext == "docx":
             return _extract_docx(data), {}
+        if ext in _LEGACY_WORD_EXTENSIONS:
+            if data[:2] == b"PK":   # really a .docx with an old extension
+                return _extract_docx(data), {}
+            return extract_doc(data), {}
+        if ext in _LEGACY_POWERPOINT_EXTENSIONS:
+            return extract_ppt(data), {}
         if ext == "msg":
             return _extract_msg(data)
         if ext in _IMAGE_EXTENSIONS:
