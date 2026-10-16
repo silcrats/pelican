@@ -22,10 +22,11 @@ search UI built for it.
 - **SharePoint Online** via Graph with `Sites.Selected` (only the sites you
   grant): delta queries per library, extension whitelist, site group members
   mirrored as access.
-- **Text extraction** for PDF (isolated, with a timeout), DOCX, Word and
-  PowerPoint 97-2003 (DOC, PPT, including speaker notes), EML/MSG
-  (including attachments) and plain text; EXIF camera and GPS data for images,
-  reverse-geocoded offline.
+- **Text extraction** for PDF (isolated, with a timeout), Word (DOCX, DOC),
+  PowerPoint (PPTX, PPT, including speaker notes), ODT, RTF, EML/MSG and plain
+  text; attachment names for email, and EXIF camera and GPS data for images,
+  reverse-geocoded offline. Files indexed before a format was supported get
+  its text on the next crawl. Spreadsheets are indexed by filename only.
 - **Fail-closed access**: if permissions can't be read, new content is
   restricted and existing content keeps its last known access.
 - **Built for unattended runs**: one-shot jobs, a process watchdog for silent

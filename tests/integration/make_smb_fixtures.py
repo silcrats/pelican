@@ -17,11 +17,14 @@ EXPECTED = {
     "Finance/report.docx": "Pelican Word fixture",
     "Finance/scan.pdf": "Pelican PDF fixture",
 }
-# Word/PowerPoint 97-2003 files, made with LibreOffice (they can't be
-# generated here), stored gzipped in fixtures/.
-LEGACY = {
+# Office files made with LibreOffice (they can't be generated here), stored
+# gzipped in fixtures/.
+OFFICE = {
     "Finance/legacy-word.doc": "Ελληνικά 中文",
     "Finance/legacy-powerpoint.ppt": "secret word walrus",   # from the speaker notes
+    "Finance/slides.pptx": "secret word walrus",
+    "Finance/report.odt": "Ελληνικά 中文",
+    "Finance/report.rtf": "Ελληνικά 中文",
 }
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
@@ -64,7 +67,7 @@ def main(root: str) -> None:
         else:
             write_pdf(path, text)
         os.chmod(path, 0o644)
-    for rel in LEGACY:
+    for rel in OFFICE:
         path = os.path.join(root, rel)
         with gzip.open(os.path.join(FIXTURES_DIR, os.path.basename(rel) + ".gz")) as src, open(path, "wb") as out:
             out.write(src.read())
@@ -72,7 +75,7 @@ def main(root: str) -> None:
     # Excluded by config/shares.yaml's exclude_extensions: must not be indexed.
     with open(os.path.join(root, "Finance", "skip.zip"), "wb") as f:
         f.write(b"PK\x05\x06" + b"\0" * 18)
-    print(f"wrote {len(EXPECTED) + len(LEGACY) + 1} files under {root}/Finance")
+    print(f"wrote {len(EXPECTED) + len(OFFICE) + 1} files under {root}/Finance")
 
 
 if __name__ == "__main__":
