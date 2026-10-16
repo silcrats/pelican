@@ -14,7 +14,7 @@ db = sqlite3.connect(settings.STATE_DB_PATH)
     "SELECT first_seen FROM extraction_revisions WHERE revision = '2026-10-office-formats'").fetchone()
 changed = db.execute(
     "UPDATE file_state SET indexed_at = ? WHERE " + " OR ".join(
-        f"smb_url LIKE '%.{ext}'" for ext in ("doc", "ppt", "pptx", "odt", "rtf")),
+        f"smb_url LIKE '%.{ext}'" for ext in ("doc", "ppt", "pptx", "odp", "odt", "rtf")),
     (first_seen - 86400,)).rowcount
 db.commit()
 print(changed)

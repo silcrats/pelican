@@ -23,6 +23,7 @@ OFFICE = {
     "Finance/legacy-word.doc": "Ελληνικά 中文",
     "Finance/legacy-powerpoint.ppt": "secret word walrus",   # from the speaker notes
     "Finance/slides.pptx": "secret word walrus",
+    "Finance/slides.odp": "secret word walrus",
     "Finance/report.odt": "Ελληνικά 中文",
     "Finance/report.rtf": "Ελληνικά 中文",
 }

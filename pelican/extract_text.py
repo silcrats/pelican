@@ -15,7 +15,7 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 
 from .extract_legacy_office import extract_doc, extract_ppt
-from .extract_office_text import extract_odt, extract_pptx, extract_rtf
+from .extract_office_text import extract_odp, extract_odt, extract_pptx, extract_rtf
 
 PDF_TIMEOUT_SECONDS = int(os.environ.get("PDF_TIMEOUT_SECONDS", "30"))
 
@@ -362,7 +362,7 @@ _LEGACY_POWERPOINT_EXTENSIONS = {"ppt", "pps", "pot"}
 # and extracted again once, even though they haven't changed (see
 # state.extraction_cutoffs). Never rename or remove an entry.
 EXTRACTION_REVISIONS: dict[str, set[str]] = {
-    "2026-10-office-formats": _LEGACY_WORD_EXTENSIONS | _LEGACY_POWERPOINT_EXTENSIONS | {"pptx", "odt", "rtf"},
+    "2026-10-office-formats": _LEGACY_WORD_EXTENSIONS | _LEGACY_POWERPOINT_EXTENSIONS | {"pptx", "odt", "odp", "rtf"},
 }
 _PLAIN_TEXT_EXTENSIONS = {"txt", "md", "csv", "log", "json", "xml", "html", "htm", "yaml", "yml", "ini", "conf"}
 _IMAGE_EXTENSIONS = {"jpg", "jpeg", "tif", "tiff", "png", "webp"}
@@ -407,6 +407,8 @@ def extract_text(path: str, data: bytes) -> tuple[str, dict]:
             return extract_pptx(data), {}
         if ext == "odt":
             return extract_odt(data), {}
+        if ext == "odp":
+            return extract_odp(data), {}
         if ext == "rtf":
             return extract_rtf(data), {}
         if ext == "msg":

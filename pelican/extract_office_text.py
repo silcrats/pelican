@@ -1,6 +1,7 @@
 """
-Text from PowerPoint (.pptx), OpenDocument text (.odt) and RTF files, in
-pure Python. .pptx and .odt are zip files of XML; each XML part read is
+Text from PowerPoint (.pptx), OpenDocument text and presentation (.odt,
+.odp) and RTF files, in pure Python. .pptx and the OpenDocument formats are
+zip files of XML; each XML part read is
 capped at MAX_XML_PART_BYTES uncompressed, so a "zip bomb" can't exhaust
 memory. Malformed files raise; the caller (extract_text) logs and indexes
 them without text.
@@ -21,6 +22,8 @@ _NS = {
     "text": "urn:oasis:names:tc:opendocument:xmlns:text:1.0",
     "office": "urn:oasis:names:tc:opendocument:xmlns:office:1.0",
     "table": "urn:oasis:names:tc:opendocument:xmlns:table:1.0",
+    "draw": "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0",
+    "presentation": "urn:oasis:names:tc:opendocument:xmlns:presentation:1.0",
 }
 _NOTES_SLIDE_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide"
 
@@ -113,42 +116,67 @@ def _notes_text(xml: bytes) -> list[str]:
     return lines
 
 
-def extract_odt(data: bytes) -> str:
+def _odf_content(data: bytes):
+    """The office:body element of an OpenDocument file's content.xml."""
     with zipfile.ZipFile(BytesIO(data)) as zf:
         content = _read_part(zf, "content.xml")
-    if content is None:
-        return ""
-    body = ElementTree.fromstring(content).find("office:body", _NS)
+    return None if content is None else ElementTree.fromstring(content).find("office:body", _NS)
+
+
+_ODF_PARAGRAPHS = {f"{{{_NS['text']}}}p", f"{{{_NS['text']}}}h"}
+
+
+def _odf_paragraphs(el, into: list[str], skip: frozenset = frozenset()) -> None:
+    """Append each paragraph's text under `el` to `into`, in document order;
+    table rows become one line with tab-separated cells (as for .doc and
+    .rtf). Elements whose tag is in `skip` are left out."""
+    if el.tag in skip:
+        return
+    if el.tag in _ODF_PARAGRAPHS:
+        text = _odf_inline(el).strip()
+        if text:
+            into.append(text)
+        return   # nested paragraphs (notes) are inside _odf_inline's walk
+    if el.tag == f"{{{_NS['table']}}}table-row":
+        cells = []
+        for cell in el.findall("table:table-cell", _NS):
+            cell_lines: list[str] = []
+            _odf_paragraphs(cell, cell_lines, skip)
+            cells.append(" ".join(cell_lines))
+        if any(cells):
+            into.append("\t".join(cells).strip())
+        return
+    for child in el:
+        _odf_paragraphs(child, into, skip)
+
+
+def extract_odt(data: bytes) -> str:
+    body = _odf_content(data)
     if body is None:
         return ""
     lines: list[str] = []
-    paragraph_tags = {f"{{{_NS['text']}}}p", f"{{{_NS['text']}}}h"}
+    _odf_paragraphs(body, lines)
+    return "\n".join(lines)
 
-    def paragraphs(el, into: list[str]) -> None:
-        if el.tag in paragraph_tags:
-            text = _odf_inline(el).strip()
-            if text:
-                into.append(text)
-            return   # nested paragraphs (notes) are inside _odf_inline's walk
-        if el.tag == f"{{{_NS['table']}}}table-row":
-            # One line per row, cells separated by tabs (as for .doc and .rtf).
-            cells = []
-            for cell in el.findall("table:table-cell", _NS):
-                cell_lines: list[str] = []
-                paragraphs(cell, cell_lines)
-                cells.append(" ".join(cell_lines))
-            if any(cells):
-                into.append("\t".join(cells).strip())
-            return
-        for child in el:
-            paragraphs(child, into)
 
-    paragraphs(body, lines)
+def extract_odp(data: bytes) -> str:
+    """Slides in order, each followed by its speaker notes. Master slides are
+    in styles.xml, not content.xml, so their placeholder text isn't read."""
+    body = _odf_content(data)
+    if body is None:
+        return ""
+    notes_tag = f"{{{_NS['presentation']}}}notes"
+    lines: list[str] = []
+    for page in body.findall("office:presentation/draw:page", _NS):
+        _odf_paragraphs(page, lines, skip=frozenset({notes_tag}))
+        for notes in page.findall("presentation:notes", _NS):
+            _odf_paragraphs(notes, lines)
     return "\n".join(lines)
 
 
 def _odf_inline(el) -> str:
-    """A paragraph's text, with ODF's space, tab and line-break elements."""
+    """A paragraph's text, with ODF's space, tab and line-break elements
+    (page-number and page-count fields left out)."""
     out = [el.text or ""]
     for child in el:
         tag = child.tag.rsplit("}", 1)[-1]
@@ -158,7 +186,7 @@ def _odf_inline(el) -> str:
             out.append("\t")
         elif tag == "line-break":
             out.append("\n")
-        elif tag not in ("annotation", "bookmark", "bookmark-start", "bookmark-end"):
+        elif tag not in ("annotation", "bookmark", "bookmark-start", "bookmark-end", "page-number", "page-count"):
             out.append(_odf_inline(child))
         out.append(child.tail or "")
     return "".join(out)
