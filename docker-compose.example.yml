@@ -177,9 +177,9 @@ services:
       OS_USERNAME: pelican-status
       OS_PASSWORD: ${OS_STATUS_PASSWORD:?set OS_STATUS_PASSWORD in .env}
       OS_CA_CERTS: /certs/ca.pem
-      # Browser sign-in (user STATUS_USERNAME, default pelican). Plain HTTP:
-      # put it behind an HTTPS reverse proxy if it's reached over a network
-      # you don't trust.
+      # Sign-in page (user STATUS_USERNAME, default pelican). Plain HTTP: put
+      # it behind an HTTPS reverse proxy if it's reached over a network you
+      # don't trust, and set STATUS_SECURE_COOKIE=true in .env.
       STATUS_PASSWORD: ${STATUS_PASSWORD:?set STATUS_PASSWORD in .env (12+ characters)}
     volumes:
       - status:/status

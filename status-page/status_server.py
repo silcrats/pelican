@@ -1,24 +1,37 @@
 import base64
 import glob
 import hmac
+import http.cookies
 import http.server
 import json
 import os
+import secrets
 import ssl
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 STATUS_DIR = os.environ.get("STATUS_DIR", "/status")
 PORT = int(os.environ.get("PORT", "8090"))
 
-# Browser sign-in for the page and its data. Required: the page shows share,
-# mailbox and site names, error messages and index sizes.
+# Sign-in for the page and its data. Required: the page shows share, mailbox
+# and site names, error messages and index sizes. Browsers get a sign-in page
+# and a session cookie; scripts can send the same credentials as HTTP Basic.
 STATUS_USERNAME = os.environ.get("STATUS_USERNAME") or "pelican"
 STATUS_PASSWORD = os.environ.get("STATUS_PASSWORD", "")
 MIN_PASSWORD_LENGTH = 12
+SESSION_SECONDS = 8 * 3600
+SESSION_COOKIE = "pelican_status_session"
+# Set when the page is reached over HTTPS (e.g. behind a reverse proxy), so
+# the session cookie is never sent over plain HTTP.
+SECURE_COOKIE = os.environ.get("STATUS_SECURE_COOKIE", "").lower() in ("1", "true", "yes")
+FAILED_SIGN_IN_DELAY_SECONDS = 1   # slows password guessing
+
+_sessions: dict[str, float] = {}   # token -> expiry; signed out by a restart
+_sessions_lock = threading.Lock()
 
 # --- OpenSearch storage view -------------------------------------------------
 OS_HOST = os.environ.get("OS_HOST", "http://opensearch:9200").rstrip("/")
@@ -35,6 +48,42 @@ HISTORY_PATH = os.environ.get("STORAGE_HISTORY_PATH", os.path.join(STATUS_DIR, "
 HISTORY_MIN_INTERVAL_SECONDS = 6 * 3600   # at most one history snapshot per 6h
 HISTORY_MAX_SNAPSHOTS = 500               # ~4 months at 4/day
 GROWTH_WINDOW_DAYS = 7
+
+LOGIN_PAGE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pelican Status - Sign in</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0;
+         min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .card { width: 100%; max-width: 340px; background: #191919; border: 1px solid #2a2a2a;
+          border-radius: 8px; padding: 1.8rem; margin: 1rem; }
+  h1 { font-size: 1.3rem; margin: 0 0 1.4rem; text-align: center; }
+  label { display: block; color: #888; font-size: 0.85rem; margin-bottom: 0.35rem; }
+  input { width: 100%; box-sizing: border-box; background: #111; color: #eee; border: 1px solid #333;
+          border-radius: 6px; padding: 0.6rem 0.75rem; font: inherit; margin-bottom: 1rem; }
+  input:focus { outline: none; border-color: #4caf50; }
+  button { width: 100%; background: #4caf50; color: #111; border: none; border-radius: 6px;
+           padding: 0.65rem; font: inherit; font-weight: 600; cursor: pointer; }
+  button:hover { background: #5cbf60; }
+  .error { color: #e05252; font-size: 0.9rem; margin-bottom: 1rem; text-align: center; }
+</style>
+</head>
+<body>
+<form class="card" method="post" action="/login">
+  <h1>Pelican Status</h1>
+  <!--error-->
+  <label for="username">Username</label>
+  <input id="username" name="username" autocomplete="username" required autofocus>
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  <button type="submit">Sign in</button>
+</form>
+</body>
+</html>
+"""
 
 PAGE = """<!doctype html>
 <html>
@@ -91,10 +140,18 @@ PAGE = """<!doctype html>
   .subtabs .tab.active.c-exchange { color: #2b88d8; }
   .subtabs .tab.active.c-sharepoint { color: #2fa84f; }
   .subtabs .tab.active.c-acl { color: #f0932b; }
+  header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 1.5rem; }
+  header h1 { margin: 0; }
+  .signout { background: none; border: 1px solid #333; border-radius: 6px; color: #888; font: inherit;
+             font-size: 0.85rem; padding: 0.3rem 0.8rem; cursor: pointer; }
+  .signout:hover { color: #ccc; border-color: #555; }
 </style>
 </head>
 <body>
-<h1>Pelican Status</h1>
+<header>
+  <h1>Pelican Status</h1>
+  <form method="post" action="/logout"><button type="submit" class="signout">Sign out</button></form>
+</header>
 <div class="tabs" id="top-tabs">
   <button type="button" class="tab active" data-tab="crawling">Crawling</button>
   <button type="button" class="tab" data-tab="storage">Storage</button>
@@ -241,6 +298,7 @@ async function refreshStorage() {
   const el = document.getElementById('storage');
   try {
     const res = await fetch('/storage.json?' + Date.now());
+    if (res.status === 401) { location.href = '/login'; return; }   // session expired
     if (!res.ok) throw new Error('bad response');
     const s = await res.json();
     if (!s.data) {
@@ -293,6 +351,7 @@ async function refresh() {
   const root = document.getElementById('root');
   try {
     const res = await fetch('/status.json?' + Date.now());
+    if (res.status === 401) { location.href = '/login'; return; }   // session expired
     if (!res.ok) throw new Error('bad response');
     const data = await res.json();
     consecutiveFailures = 0;
@@ -540,16 +599,62 @@ def _storage_loop() -> None:
         time.sleep(STORAGE_REFRESH_SECONDS)
 
 
+def _credentials_ok(user: str, password: str) -> bool:
+    # Compare both, always, so timing doesn't reveal which was wrong.
+    ok_user = hmac.compare_digest(user.encode(), STATUS_USERNAME.encode())
+    ok_password = hmac.compare_digest(password.encode(), STATUS_PASSWORD.encode())
+    return ok_user and ok_password
+
+
+def _new_session() -> str:
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with _sessions_lock:
+        for t in [t for t, expiry in _sessions.items() if expiry < now]:
+            del _sessions[t]
+        _sessions[token] = now + SESSION_SECONDS
+    return token
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
-    def _send_json(self, payload) -> None:
-        data = json.dumps(payload).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+    # Drop a connection that stops sending mid-request, rather than holding a
+    # thread for it indefinitely.
+    timeout = 30
+
+    def _send(self, status: int, body: bytes, content_type: str, headers: dict | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")   # not embeddable in other sites' frames
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(body)
+
+    def _send_json(self, payload, status: int = 200) -> None:
+        self._send(status, json.dumps(payload).encode(), "application/json")
+
+    def _redirect(self, location: str, headers: dict | None = None) -> None:
+        self._send(303, b"", "text/plain", {"Location": location, **(headers or {})})
+
+    def _session_token(self) -> str | None:
+        cookie = http.cookies.SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie") or "")
+        except http.cookies.CookieError:
+            return None
+        morsel = cookie.get(SESSION_COOKIE)
+        return morsel.value if morsel else None
 
     def _signed_in(self) -> bool:
+        """A session from the sign-in page, or HTTP Basic credentials (for
+        scripts; browsers are never asked for them)."""
+        token = self._session_token()
+        if token:
+            with _sessions_lock:
+                expiry = _sessions.get(token)
+            if expiry and expiry > time.time():
+                return True
         scheme, _, encoded = (self.headers.get("Authorization") or "").partition(" ")
         if scheme.lower() != "basic":
             return False
@@ -557,30 +662,52 @@ class Handler(http.server.BaseHTTPRequestHandler):
             user, _, password = base64.b64decode(encoded, validate=True).decode("utf-8").partition(":")
         except ValueError:
             return False
-        # Compare both, always, so timing doesn't reveal which was wrong.
-        ok_user = hmac.compare_digest(user.encode(), STATUS_USERNAME.encode())
-        ok_password = hmac.compare_digest(password.encode(), STATUS_PASSWORD.encode())
-        return ok_user and ok_password
+        return _credentials_ok(user, password)
+
+    def _session_cookie(self, token: str, max_age: int) -> str:
+        cookie = f"{SESSION_COOKIE}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Strict"
+        return cookie + ("; Secure" if SECURE_COOKIE else "")
 
     def do_GET(self):
+        url = urllib.parse.urlsplit(self.path)
+        if url.path == "/login":
+            if self._signed_in():
+                return self._redirect("/")
+            failed = "failed" in urllib.parse.parse_qs(url.query)
+            error = '<div class="error">Wrong username or password.</div>' if failed else ""
+            return self._send(200, LOGIN_PAGE.replace("<!--error-->", error).encode(), "text/html; charset=utf-8")
         if not self._signed_in():
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="Pelican status", charset="UTF-8"')
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"Sign-in required\n")
-            return
-        if self.path.startswith("/status.json"):
+            if url.path in ("/status.json", "/storage.json"):
+                return self._send_json({"error": "Sign-in required"}, status=401)
+            return self._redirect("/login")
+        if url.path == "/status.json":
             self._send_json({"jobs": _collect_jobs()})
-        elif self.path.startswith("/storage.json"):
+        elif url.path == "/storage.json":
             with _storage_lock:
                 snapshot = dict(_storage)
             self._send_json(snapshot)
         else:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(PAGE.encode())
+            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+
+    def do_POST(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/login":
+            length = min(int(self.headers.get("Content-Length") or 0), 4096)
+            form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+            user = (form.get("username") or [""])[0]
+            password = (form.get("password") or [""])[0]
+            if not _credentials_ok(user, password):
+                time.sleep(FAILED_SIGN_IN_DELAY_SECONDS)
+                return self._redirect("/login?failed=1")
+            token = _new_session()
+            return self._redirect("/", {"Set-Cookie": self._session_cookie(token, SESSION_SECONDS)})
+        if path == "/logout":
+            token = self._session_token()
+            if token:
+                with _sessions_lock:
+                    _sessions.pop(token, None)
+            return self._redirect("/login", {"Set-Cookie": self._session_cookie("", 0)})
+        self._send(404, b"Not found\n", "text/plain")
 
     def log_message(self, format, *args):
         pass  # keep container logs quiet

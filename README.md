@@ -90,7 +90,8 @@ that hold them (`user_env` / `pass_env` / `domain_env` for SMB,
 | `JOB_NAME`, `STATUS_DIR` | `primary`, `/status` | Status file name and location |
 | `SHARE_NAMES`, `MAILBOX_NAMES`, `SITE_NAMES` | all | Comma-separated subset for this container, to split work across containers |
 | `TZ` | UTC | Time zone for status timestamps |
-| `STATUS_PASSWORD`, `STATUS_USERNAME` | required, `pelican` | Status page sign-in. It won't start without a password of 12+ characters |
+| `STATUS_PASSWORD`, `STATUS_USERNAME` | required, `pelican` | Status page sign-in (a sign-in page for browsers; scripts can send them as HTTP Basic). It won't start without a password of 12+ characters |
+| `STATUS_SECURE_COOKIE` | off | Set to `true` when the status page is served over HTTPS (e.g. behind a reverse proxy), so its session cookie is never sent over plain HTTP |
 
 Tuning (all optional): `BATCH_SIZE`, `SMB_WORKERS`, `GRAPH_WORKERS`,
 `SP_WORKERS`, `ACL_SYNC_WORKERS`, `ACL_RECHECK_HOURS`, `PDF_TIMEOUT_SECONDS`,

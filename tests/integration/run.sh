@@ -121,9 +121,38 @@ import json, sys
 s = json.load(sys.stdin)
 sys.exit(0 if not s.get("error") and (s.get("data") or {}).get("docs", 0) >= 3 else 1)'
 }
-check "status page refuses requests without sign-in" test "$(code "$STATUS/status.json")" = 401
-check "status page refuses a wrong password" test "$(code -u pelican:wrong "$STATUS/status.json")" = 401
-check "status page lists the SMB job when signed in" status_lists_job
+# Browser flow: sign-in page and session cookie, never the browser's popup.
+COOKIES=$(mktemp)
+page_redirects_to_login() {
+  local headers
+  headers=$(curl -s -o /dev/null -D - "$STATUS/" | tr -d '\r')
+  grep -q "^HTTP/[0-9.]* 303" <<< "$headers" && grep -qi "^location: /login" <<< "$headers" \
+    && ! grep -qi "^www-authenticate" <<< "$headers"
+}
+wrong_password_refused() {
+  test "$(curl -s -o /dev/null -w '%{redirect_url}' -d 'username=pelican&password=wrong' "$STATUS/login")" \
+    = "$STATUS/login?failed=1"
+}
+sign_in_gives_session() {
+  curl -s -o /dev/null -c "$COOKIES" --data-urlencode username=pelican --data-urlencode "password=$STATUS_PW" \
+    "$STATUS/login"
+  grep -q test-finance <<< "$(curl -s -b "$COOKIES" "$STATUS/status.json")"
+}
+sign_out_ends_session() {
+  local token
+  token=$(awk '/pelican_status_session/ {print $7}' "$COOKIES")
+  curl -s -o /dev/null -b "$COOKIES" -X POST "$STATUS/logout"
+  test "$(code -b "pelican_status_session=$token" "$STATUS/status.json")" = 401
+}
+check "status page sends browsers to its sign-in page (no popup)" page_redirects_to_login
+check "status page data refuses requests without sign-in" test "$(code "$STATUS/status.json")" = 401
+check "status page sign-in refuses a wrong password" wrong_password_refused
+check "status page sign-in gives a session that reads the job list" sign_in_gives_session
+check "status page sign-out ends the session" sign_out_ends_session
+rm -f "$COOKIES"
+# Scripts: the same credentials as HTTP Basic.
+check "status page refuses a wrong password (Basic)" test "$(code -u pelican:wrong "$STATUS/status.json")" = 401
+check "status page lists the SMB job (Basic)" status_lists_job
 "${COMPOSE[@]}" restart status >/dev/null 2>&1; sleep 5   # storage view refreshes at start
 check "status page reads index stats with its account" status_reads_index
 
