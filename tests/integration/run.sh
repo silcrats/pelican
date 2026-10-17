@@ -171,6 +171,8 @@ check "status page sends browsers to its sign-in page (no popup)" page_redirects
 check "status page data refuses requests without sign-in" test "$(code "$STATUS/status.json")" = 401
 check "status page sign-in refuses a wrong password" wrong_password_refused
 check "status page sign-in gives a session that reads the job list" sign_in_gives_session
+check "status page shows its version once signed in" \
+  grep -q 'class="version">dev<' <<< "$(curl -s -u "pelican:$STATUS_PW" "$STATUS/")"
 check "status page sign-out ends the session" sign_out_ends_session
 rm -f "$COOKIES"
 # Scripts: the same credentials as HTTP Basic.

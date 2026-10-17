@@ -1,6 +1,7 @@
 import base64
 import glob
 import hmac
+import html
 import http.cookies
 import http.server
 import json
@@ -31,6 +32,23 @@ SECURE_COOKIE = os.environ.get("STATUS_SECURE_COOKIE", "").lower() in ("1", "tru
 FAILED_SIGN_IN_DELAY_SECONDS = 1   # slows password guessing
 
 _sessions: dict[str, float] = {}   # token -> expiry; signed out by a restart
+
+
+def _read_version() -> str:
+    """"v0.3.0" for a release, "main (49c751e)" for a branch build, "dev" for
+    a local one; from the version file the image build writes."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "version")) as f:
+            version, _, revision = f.read().partition("\n")
+    except OSError:
+        return "dev"
+    version, revision = version.strip() or "dev", revision.strip()[:7]
+    if version[:1].isdigit():
+        return f"v{version}"
+    return f"{version} ({revision})" if revision else version
+
+
+VERSION = _read_version()
 _sessions_lock = threading.Lock()
 
 # --- OpenSearch storage view -------------------------------------------------
@@ -142,6 +160,7 @@ PAGE = """<!doctype html>
   .subtabs .tab.active.c-acl { color: #f0932b; }
   header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 1.5rem; }
   header h1 { margin: 0; }
+  .version { color: #666; font-size: 0.8rem; font-weight: normal; margin-left: 0.5rem; }
   .signout { background: none; border: 1px solid #333; border-radius: 6px; color: #888; font: inherit;
              font-size: 0.85rem; padding: 0.3rem 0.8rem; cursor: pointer; }
   .signout:hover { color: #ccc; border-color: #555; }
@@ -149,7 +168,7 @@ PAGE = """<!doctype html>
 </head>
 <body>
 <header>
-  <h1>Pelican Status</h1>
+  <h1>Pelican Status<span class="version"><!--version--></span></h1>
   <form method="post" action="/logout"><button type="submit" class="signout">Sign out</button></form>
 </header>
 <div class="tabs" id="top-tabs">
@@ -687,7 +706,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 snapshot = dict(_storage)
             self._send_json(snapshot)
         else:
-            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            page = PAGE.replace("<!--version-->", html.escape(VERSION))
+            self._send(200, page.encode(), "text/html; charset=utf-8")
 
     def do_POST(self):
         path = urllib.parse.urlsplit(self.path).path
