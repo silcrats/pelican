@@ -101,6 +101,35 @@ services:
       opensearch:
         condition: service_healthy
 
+  # Vector search only (VECTOR_ENABLED=true in .env): the embedding model,
+  # served by Hugging Face Text Embeddings Inference. In the `vector`
+  # profile, so it only starts with COMPOSE_PROFILES=vector in .env. Runs on
+  # the CPU; to use an NVIDIA GPU, add docker-compose.gpu.yml (see there).
+  # Downloads the model on first start into the embeddings-cache volume.
+  embeddings:
+    image: ${EMBEDDINGS_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}
+    profiles: [vector]
+    environment:
+      MODEL_ID: ${EMBEDDINGS_MODEL:-BAAI/bge-base-en-v1.5}
+      # Only OpenSearch (the connector the opensearch-users job creates) has it.
+      API_KEY: ${EMBEDDINGS_API_KEY:-}
+      # The pipeline sends every passage of a document in one request
+      # (vector.max_chunks in pelican.yaml, 100 by default), and a crawler's
+      # bulk write (BATCH_SIZE documents) all at once: queue that many
+      # passages for several crawlers instead of refusing them.
+      MAX_CLIENT_BATCH_SIZE: "512"
+      MAX_CONCURRENT_REQUESTS: "20000"
+    volumes:
+      - embeddings-cache:/data
+    networks: [search]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+    restart: unless-stopped
+
   # SMB: crawler + ACL sync share one state volume. To crawl several servers
   # in parallel, add more pairs with their own SHARE_NAMES, JOB_NAME and volume.
   crawl-smb:
@@ -245,3 +274,4 @@ volumes:
   state-sharepoint:
   exo-permissions:
   status:
+  embeddings-cache:

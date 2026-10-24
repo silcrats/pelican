@@ -28,6 +28,9 @@ search UI built for it.
   for images, reverse-geocoded offline. Files indexed before a format was
   supported get its text on the next crawl. Spreadsheets are indexed by
   filename only.
+- **Optional vector search**: passages embedded in OpenSearch's ingest
+  pipeline, on a CPU or NVIDIA GPU, for search by meaning (see
+  [Vector search](#vector-search)). Off by default.
 - **Fail-closed access**: if permissions can't be read, new content is
   restricted and existing content keeps its last known access.
 - **Built for unattended runs**: one-shot jobs, a process watchdog for silent
@@ -187,6 +190,63 @@ opensearch ...`); port 9200 isn't published. The crawlers' state volumes
 aren't snapshotted: if one is lost, that crawler re-indexes its sources on
 its next run.
 
+## Vector search
+
+Optional, and off by default. With it on, OpenSearch splits each document's
+text into passages of about 300 words as it's indexed, embeds them with an
+English model (`BAAI/bge-base-en-v1.5` by default), and stores one vector
+per passage. A search UI can then find documents by meaning as well as by
+words (Frogmouth's Semantic and Hybrid modes). The crawlers don't change:
+everything happens in OpenSearch's ingest pipeline.
+
+To turn it on, before the first crawl, add to `.env`:
+
+```sh
+VECTOR_ENABLED=true
+COMPOSE_PROFILES=vector                    # starts the embeddings service
+EMBEDDINGS_API_KEY=<long random string>    # e.g. openssl rand -hex 24
+```
+
+The `embeddings` service runs Hugging Face Text Embeddings Inference, on
+the CPU by default. With an NVIDIA GPU (driver and Container Toolkit on the
+host), add [docker-compose.gpu.yml](docker-compose.gpu.yml), e.g.
+`COMPOSE_FILE=docker-compose.example.yml:docker-compose.gpu.yml` in `.env`,
+and set `EMBEDDINGS_IMAGE` if your card isn't an RTX 30xx (the file lists
+the image per GPU generation). A GPU makes a large difference: an RTX 3070
+embeds a few hundred passages a second.
+
+`opensearch-users` then connects OpenSearch to the service (only
+OpenSearch has its key), creates the `pelican-embed` ingest pipeline and
+the `pelican-search` search pipeline, and gives `pelican` and
+`pelican-reader` the two ML permissions they need (to read and call the
+model). On first start it waits up to 15 minutes while the service
+downloads the model. Each run replaces the model and its connector with
+fresh ones.
+
+Things to know:
+
+- **New index only.** The index is created with the vector fields and
+  pipelines; an existing index keeps its mapping, and crawlers log a warning
+  if vector search is on but the index has none. To add vectors, delete the
+  index and the crawlers' state volumes, then crawl again. Changing the
+  model or `dimension` needs the same.
+- **Only the start of long documents is embedded:** up to `max_chunks`
+  passages (100 by default, about 30,000 words). All of the text stays
+  searchable by keyword.
+- **Access changes don't re-embed.** The ACL sync's role updates go through
+  the pipeline, which reuses a document's stored vectors when its text
+  hasn't changed. A changed file is embedded again.
+- **The embeddings service is now in the indexing path.** If it's down,
+  bulk writes fail and the crawl reports the share as failed, to be retried
+  on the next run.
+- **Searches must filter inside the vector query.** Put the role filter in
+  the `neural` query's `filter`, not only around it: otherwise the nearest
+  passages can all belong to documents the user can't see, and they get
+  too few results or none. The search pipeline supplies the model, so
+  queries don't name it.
+
+Settings are under `vector:` in `config/pelican.yaml`.
+
 ## Index contract
 
 Any search UI reading the index must agree with `config/pelican.yaml`:
@@ -200,6 +260,10 @@ Any search UI reading the index must agree with `config/pelican.yaml`:
   `sharepoint-online`; `share` is the share, mailbox or site name.
 - **Index.** `opensearch.index`, created with `search_index_mapping.json` on
   first run.
+- **Vectors** (only with vector search on). `content_embedding` is a nested
+  field with one `{"knn": [...]}` object per passage of `content`; the
+  index's default search pipeline fills in the model for `neural` queries
+  and blends `hybrid` query scores.
 
 Changing prefixes or `host` values on an existing index needs a full re-crawl.
 
@@ -217,7 +281,8 @@ pelican/                           shared core
   graph_client.py                  Microsoft Graph client
   extract_text.py                  text and metadata extraction
   status.py, watchdog.py           progress reporting, hang protection
-  opensearch_setup.py              certificates and accounts (compose example)
+  opensearch_setup.py              certificates, accounts and vector search
+                                   setup (compose example)
 config/                            example configuration
 search_index_mapping.json          index mapping
 requirements.in                    direct dependencies; requirements.txt is
@@ -232,6 +297,7 @@ tests/integration/                 end-to-end test (run.sh)
 
 ```sh
 tests/integration/run.sh
+VECTOR=1 tests/integration/run.sh     # the same, with vector search on
 ```
 
 builds the images from your checkout and runs the compose example with a
@@ -239,7 +305,11 @@ test Samba server: a real SMB crawl (text, Word and PDF extraction, ACL
 roles, exclusions), the ACL sync, every OpenSearch account's permissions,
 the status page sign-in, snapshots and the scheduler proxy. It uses its
 own project name, volumes and ports, so it can run next to a real
-deployment. GitHub Actions runs it before building any image, including
+deployment. With `VECTOR=1` it also starts the CPU embeddings service
+(downloading the model, about 450 MB, each run) and checks that every
+fixture is embedded, that a role-filtered neural query as `pelican-reader`
+finds exactly what those roles allow, and that a role change doesn't
+re-embed anything. GitHub Actions runs it before building any image, including
 on Dependabot's pull requests.
 
 ## AI disclosure

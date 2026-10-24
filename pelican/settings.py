@@ -69,6 +69,19 @@ HOST_SMB: str = _sources.get("smb", "smb-share")
 HOST_EXCHANGE: str = _sources.get("exchange", "exchange-online")
 HOST_SHAREPOINT: str = _sources.get("sharepoint", "sharepoint-online")
 
+_vector = _cfg.get("vector") or {}
+VECTOR_ENABLED: bool = str(_vector.get("enabled", "false")).strip().lower() in ("true", "1", "yes", "on")
+EMBEDDINGS_URL: str = _vector.get("embeddings_url") or "http://embeddings/embed"
+EMBEDDINGS_API_KEY: str = _vector.get("api_key") or ""
+EMBEDDINGS_MODEL: str = _vector.get("model") or "BAAI/bge-base-en-v1.5"
+VECTOR_DIMENSION: int = int(_vector.get("dimension") or 768)
+CHUNK_WORDS: int = int(_vector.get("chunk_words") or 300)
+CHUNK_OVERLAP: float = float(_vector.get("chunk_overlap") or 0.1)
+MAX_CHUNKS: int = int(_vector.get("max_chunks") or 100)
+# Fixed names: the index refers to these pipelines, the setup job creates them.
+INGEST_PIPELINE = "pelican-embed"
+SEARCH_PIPELINE = "pelican-search"
+
 STATE_DB_PATH: str = _state.get("db_path") or "/state/pelican_state.db"
 
 STATUS_DIR: str = _status.get("dir") or "/status"

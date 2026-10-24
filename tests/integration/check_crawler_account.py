@@ -51,6 +51,11 @@ hits = client.search(index=settings.SEARCH_INDEX, body={"query": {"term": {"shar
 stored = {h["_source"]["filename"]: h["_source"]["role"] for h in hits}
 check("bulk delete removed gone.txt", "gone.txt" not in stored)
 check("role update applied to keep.txt", stored.get("keep.txt") == ["2staff"])
+if settings.VECTOR_ENABLED:
+    kept = next((h["_source"] for h in hits if h["_source"]["filename"] == "keep.txt"), {})
+    vectors = kept.get(index.VECTOR_FIELD) or []
+    check("keep.txt embedded by the ingest pipeline",
+          len(vectors) == 1 and len(vectors[0].get("knn", [])) == settings.VECTOR_DIMENSION)
 
 refused("delete the index", lambda: client.indices.delete(index=settings.SEARCH_INDEX))
 refused("create another index", lambda: client.indices.create(index="not-pelican"))
@@ -58,5 +63,14 @@ refused("write to another index", lambda: client.index(index="not-pelican", body
 refused("read the security config",
         lambda: client.transport.perform_request("GET", "/_plugins/_security/api/internalusers"))
 refused("take a snapshot", lambda: client.snapshot.create(repository="pelican-backups", snapshot="x"))
+if settings.VECTOR_ENABLED:
+    # A valid connector, so the refusal is the permission check and not validation.
+    refused("create an ML connector", lambda: client.transport.perform_request(
+        "POST", "/_plugins/_ml/connectors/_create", body={
+            "name": "x", "version": 1, "protocol": "http", "parameters": {}, "credential": {"key": "x"},
+            "actions": [{"action_type": "predict", "method": "POST", "url": settings.EMBEDDINGS_URL,
+                         "request_body": "{}"}]}))
+    refused("change the embedding pipeline", lambda: client.transport.perform_request(
+        "PUT", f"/_ingest/pipeline/{settings.INGEST_PIPELINE}", body={"processors": []}))
 
 sys.exit(f"{len(failures)} check(s) failed" if failures else 0)

@@ -4,6 +4,9 @@
 # the results and the access controls. Builds the images from this checkout.
 #
 #   tests/integration/run.sh            from the repo root
+#   VECTOR=1 tests/integration/run.sh   the same with vector search on (the
+#                                       CPU embeddings image; downloads the
+#                                       model, ~450 MB, on each run)
 #
 # Needs Docker with Compose and python3. Uses its own project name and
 # volumes and removes them afterwards; refuses to run if .env exists, since
@@ -32,6 +35,17 @@ SMB_USER=pelican-test
 SMB_PASS=Smb-Test-Pw-1
 SMB_DOMAIN=
 EOF
+SERVICES=(status samba samba-encrypted)
+READER_PW='Itest-Reader-Pw-5!'
+if [ "${VECTOR:-}" = 1 ]; then
+  cat >> .env <<EOF
+OS_READER_PASSWORD='$READER_PW'
+VECTOR_ENABLED=true
+COMPOSE_PROFILES=vector
+EMBEDDINGS_API_KEY=Itest-Embeddings-Key-1
+EOF
+  SERVICES+=(embeddings)
+fi
 
 cleanup() {
   if [ "${KEEP:-}" != 1 ]; then
@@ -55,8 +69,8 @@ echo "== build"
 "${COMPOSE[@]}" build opensearch-certs status || exit 1
 
 echo "== start OpenSearch, accounts, status page, Samba"
-"${COMPOSE[@]}" up -d --no-build status samba samba-encrypted || { "${COMPOSE[@]}" logs; exit 1; }
-"${COMPOSE[@]}" logs opensearch-users | grep -E '\[(users|snapshots)\]'
+"${COMPOSE[@]}" up -d --no-build "${SERVICES[@]}" || { "${COMPOSE[@]}" logs; exit 1; }
+"${COMPOSE[@]}" logs opensearch-users | grep -E '\[(users|vector|snapshots)\]'
 
 echo "== crawler account"
 check "crawler account can do a crawl's operations, and no more" \
@@ -102,6 +116,53 @@ encryption_enforced() {
 }
 check "test server refuses unencrypted (SMB 2.1) clients" encryption_enforced
 check "sync_smb_acl.py exits 0" "${COMPOSE[@]}" run --rm --no-deps sync-smb-acl
+
+if [ "${VECTOR:-}" = 1 ]; then
+  echo "== vector search"
+  # Vectors come back from _source only when it isn't narrowed to them (an
+  # include list returns each knn as a number), so exclude content instead.
+  fixtures_embedded() {
+    os_admin "https://localhost:9200/documents/_search?size=20" \
+      -d '{"query": {"term": {"share": "test-finance"}}, "_source": {"excludes": ["content"]}}' > "$HITS"
+    python3 - "$HITS" <<'EOF'
+import json, sys
+hits = json.load(open(sys.argv[1]))["hits"]["hits"]
+ok = len(hits) >= 9
+for h in hits:
+    vectors = h["_source"].get("content_embedding") or []
+    print(f"     {h['_source']['filename']}: {len(vectors)} passage vector(s)")
+    ok &= bool(vectors) and all(len(v["knn"]) == 768 for v in vectors)
+sys.exit(0 if ok else 1)
+EOF
+  }
+  # Hits for a neural query as pelican-reader (the search UI's account),
+  # filtered to the given roles the way Frogmouth filters to a user's.
+  reader_hits() {  # reader_hits <roles JSON array>
+    "${COMPOSE[@]}" exec -T opensearch curl -sk -u "pelican-reader:$READER_PW" -H 'Content-Type: application/json' \
+      https://localhost:9200/documents/_search -d '{"size": 50, "query": {"nested": {"path": "content_embedding",
+        "query": {"neural": {"content_embedding.knn": {"query_text": "a walrus in the presentation notes", "k": 50,
+          "filter": {"terms": {"role": '"$1"'}}}}}}}}' \
+      | python3 -c 'import json, sys; d = json.load(sys.stdin); print(len(d["hits"]["hits"]) if "hits" in d else "error: " + str(d)[:200])'
+  }
+  fixture_roles=$(os_admin "https://localhost:9200/documents/_search?size=1" \
+    -d '{"query": {"term": {"filename.keyword": "slides.pptx"}}}' \
+    | python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)["hits"]["hits"][0]["_source"]["role"]))')
+  embed_count() { "${COMPOSE[@]}" exec -T embeddings curl -s localhost/metrics | awk '/^te_embed_count/ {print $2}'; }
+  role_change_not_reembedded() {
+    local before after
+    before=$(embed_count)
+    os_admin -XPOST "https://localhost:9200/documents/_update_by_query?refresh=true" \
+      -d '{"query": {"term": {"share": "test-finance"}}, "script": {"source": "ctx._source.role.add('2itest')"}}' >/dev/null
+    after=$(embed_count)
+    echo "     embeddings computed: $before before, $after after"
+    [ -n "$before" ] && [ "$before" = "$after" ]
+  }
+  check "every fixture has passage vectors" fixtures_embedded
+  check "neural query as pelican-reader finds the fixtures for their roles ($fixture_roles)" \
+    test "$(reader_hits "$fixture_roles")" -gt 0
+  check "neural query as pelican-reader finds nothing for other roles" test "$(reader_hits '["Rnobody"]')" = 0
+  check "a role change (as the ACL sync makes) doesn't re-embed" role_change_not_reembedded
+fi
 
 # Files indexed before an extractor was added are extracted again once:
 # make the Office files look indexed by an older Pelican (backdated in the

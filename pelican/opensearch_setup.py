@@ -25,13 +25,21 @@ index (OpenSearch runs the policy itself):
                          "off" to not set up backups
   OS_SNAPSHOT_KEEP       how many snapshots to keep (default 14)
 
+With vector.enabled on (VECTOR_ENABLED=true; see config/pelican.yaml), it
+also connects OpenSearch to the embeddings server (EMBEDDINGS_URL,
+EMBEDDINGS_API_KEY) and creates the embedding and search pipelines, and
+gives the crawler and reader accounts the ML permissions those need.
+
 Re-running it applies password and schedule changes from the environment.
 """
 
 import datetime
 import ipaddress
 import os
+import re
+import secrets
 import sys
+import time
 
 import requests
 from cryptography import x509
@@ -39,6 +47,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from . import index as index_mod
 from . import settings
 
 CERTS_DIR = os.environ.get("CERTS_DIR", "/certs")
@@ -50,6 +59,12 @@ SNAPSHOT_POLICY = "pelican-daily"
 OS_UID = 1000        # the OpenSearch image's user
 PELICAN_UID = 10001  # the Pelican images' user
 VALID_DAYS = 3650
+# Name of the ML Commons connector and model group behind vector search.
+VECTOR_CONNECTOR = "pelican-embeddings"
+# How long to wait for the embeddings server (first start downloads the model).
+VECTOR_WAIT_SECONDS = 900
+# Temporary field the ingest pipeline splits into passages, then removes.
+CHUNK_SOURCE_FIELD = "pelican_chunk_source"
 
 NODE_DN = "CN=opensearch,O=Pelican"
 ADMIN_DN = "CN=pelican-admin,O=Pelican"
@@ -122,12 +137,15 @@ def make_certs() -> None:
     print(f"[certs] created CA, server and admin certificates in {CERTS_DIR}, valid {VALID_DAYS} days")
 
 
-def _request(method: str, path: str, body: dict | None = None, ok_missing: bool = False) -> dict | None:
-    """Call OpenSearch with the admin certificate. With ok_missing, a 404
-    returns None instead of raising."""
+def _request(method: str, path: str, body: dict | None = None, ok_missing: bool = False,
+             auth: tuple[str, str] | None = None) -> dict | None:
+    """Call OpenSearch with the admin certificate, or as `auth` (user,
+    password) if given. With ok_missing, a 404 returns None instead of
+    raising."""
     resp = requests.request(
         method, f"{settings.OS_HOST.rstrip('/')}{path}", json=body,
-        cert=(os.path.join(CERTS_DIR, "admin.pem"), os.path.join(CERTS_DIR, "admin-key.pem")),
+        auth=auth,
+        cert=None if auth else (os.path.join(CERTS_DIR, "admin.pem"), os.path.join(CERTS_DIR, "admin-key.pem")),
         verify=os.path.join(CERTS_DIR, "ca.pem"), timeout=60)
     if ok_missing and resp.status_code == 404:
         return None
@@ -155,12 +173,20 @@ def make_users() -> None:
     if missing:
         sys.exit(f"[users] missing environment variable(s): {', '.join(missing)}")
     index = settings.SEARCH_INDEX
+    if settings.VECTOR_ENABLED and not settings.EMBEDDINGS_API_KEY:
+        sys.exit("[vector] vector.enabled is on but EMBEDDINGS_API_KEY is not set")
+    # The embedding pipeline runs as the writer: it reads the model, calls it,
+    # and (skip_existing) fetches the stored copy of each document. Neural
+    # queries read the model and embed the search text as the searcher.
+    ml_use = ["cluster:admin/opensearch/ml/models/get", "cluster:admin/opensearch/ml/predict"]
+    crawler_vector = ["indices:data/read/mget", *ml_use] if settings.VECTOR_ENABLED else []
+    reader_vector = ml_use if settings.VECTOR_ENABLED else []
 
     _account("pelican", passwords["OS_PASSWORD"], "pelican_crawler", {
         # Checked at cluster level: bulk writes, and the scroll and tasks
         # APIs behind the async update_by_query in roles.py.
         "cluster_permissions": ["indices:data/write/bulk", "indices:data/read/scroll",
-                                "indices:data/read/scroll/clear", "cluster:monitor/task/get"],
+                                "indices:data/read/scroll/clear", "cluster:monitor/task/get"] + crawler_vector,
         "index_permissions": [{
             "index_patterns": [index],
             # search_shards and refresh*: update_by_query (slices="auto", refresh=True)
@@ -175,11 +201,162 @@ def make_users() -> None:
     })
     if passwords["OS_READER_PASSWORD"]:
         _account("pelican-reader", passwords["OS_READER_PASSWORD"], "pelican_reader", {
+            "cluster_permissions": reader_vector,
             "index_permissions": [{"index_patterns": [index], "allowed_actions": ["read"]}],
         })
     if passwords["OS_ADMIN_PASSWORD"]:
         _account("admin", passwords["OS_ADMIN_PASSWORD"], "all_access", None)
+    if settings.VECTOR_ENABLED:
+        setup_vector()
     setup_snapshots(index)
+
+
+def _find(kind: str, name: str, auth: tuple[str, str]) -> list[str]:
+    """Ids of ML Commons objects (connectors, models, model_groups) by name."""
+    res = _request("POST", f"/_plugins/_ml/{kind}/_search",
+                   {"size": 100, "query": {"term": {"name.keyword": name}}}, ok_missing=True, auth=auth)
+    return [h["_id"] for h in ((res or {}).get("hits") or {}).get("hits", [])]
+
+
+def setup_vector() -> None:
+    """Connect OpenSearch to the embeddings server and create the ingest and
+    search pipelines the vector index uses (see index.add_vector_mapping).
+
+    Each run registers a fresh connector and model (a connector can't be
+    edited while its model is deployed), waits until it embeds, repoints both
+    pipelines at it, then removes the ones it replaced.
+
+    The ML calls run as a `pelican-ml` account with a password made up for
+    this run: signed in with the admin certificate, ML Commons registers
+    models it can't then find."""
+    url = settings.EMBEDDINGS_URL
+    ml_auth = ("pelican-ml", f"{secrets.token_urlsafe(24)}-Aa1!")
+    _account(*ml_auth, "ml_full_access", None)
+
+    def ml(method: str, path: str, body: dict | None = None, ok_missing: bool = False) -> dict | None:
+        return _request(method, f"/_plugins/_ml/{path}", body, ok_missing=ok_missing, auth=ml_auth)
+
+    _request("PUT", "/_cluster/settings", {"persistent": {
+        "plugins.ml_commons.only_run_on_ml_node": False,
+        # The embeddings server is on the compose network, at a private address.
+        "plugins.ml_commons.connector.private_ip_enabled": True,
+        "plugins.ml_commons.trusted_connector_endpoints_regex": [f"^{re.escape(url)}$"],
+    }})
+
+    old_models = _find("models", VECTOR_CONNECTOR, ml_auth)
+    old_connectors = _find("connectors", VECTOR_CONNECTOR, ml_auth)
+    group_ids = _find("model_groups", VECTOR_CONNECTOR, ml_auth)
+    group_id = group_ids[0] if group_ids else ml(
+        "POST", "model_groups/_register",
+        {"name": VECTOR_CONNECTOR, "description": "Pelican embedding models"})["model_group_id"]
+
+    connector_id = ml("POST", "connectors/_create", {
+        "name": VECTOR_CONNECTOR,
+        "description": f"Text Embeddings Inference at {url}",
+        "version": 1,
+        "protocol": "http",
+        "parameters": {},
+        "credential": {"api_key": settings.EMBEDDINGS_API_KEY},
+        # Seconds. A bulk write queues every passage of every document in it,
+        # so allow for a long wait (on a CPU especially) and retry when the
+        # server says it's overloaded rather than failing the write.
+        "client_config": {"read_timeout": 300, "max_connection": 64, "max_retry_times": 5,
+                          "retry_backoff_policy": "exponential_full_jitter", "retry_timeout_seconds": 300},
+        "actions": [{
+            "action_type": "predict",
+            "method": "POST",
+            "url": url,
+            "headers": {"content-type": "application/json",
+                        "Authorization": "Bearer ${credential.api_key}"},
+            # truncate: a passage longer than the model's limit is cut, not rejected.
+            "request_body": '{ "inputs": ${parameters.texts}, "truncate": true }',
+            # Turns the pipeline's / query's text_docs into parameters.texts.
+            "pre_process_function": "connector.pre_process.cohere.embedding",
+            # TEI answers with a bare list of vectors.
+            "post_process_function": "connector.post_process.default.embedding",
+        }],
+    })["connector_id"]
+    model_id = ml("POST", "models/_register?deploy=true", {
+        # Not the model's own name: one with a "/" is taken as the model id.
+        "name": VECTOR_CONNECTOR,
+        "description": settings.EMBEDDINGS_MODEL,
+        "function_name": "remote",
+        "model_group_id": group_id,
+        "connector_id": connector_id,
+    })["model_id"]
+    _wait_until_embeds(lambda: ml("POST", f"_predict/text_embedding/{model_id}", {"text_docs": ["test"]}))
+
+    _request("PUT", f"/_ingest/pipeline/{settings.INGEST_PIPELINE}", {
+        "description": "Pelican: split content into passages and embed them",
+        "processors": [
+            # Only the start of a long document is embedded (max_chunks), so
+            # split a copy cut to that size; see index.CHUNK_SOURCE_CHARS.
+            {"script": {
+                "source": "String c = ctx.content; if (c != null && c.length() > params.max) "
+                          "{ c = c.substring(0, params.max); } ctx[params.field] = c;",
+                "params": {"max": index_mod.CHUNK_SOURCE_CHARS, "field": CHUNK_SOURCE_FIELD},
+            }},
+            {"text_chunking": {
+                "algorithm": {"fixed_token_length": {
+                    "token_limit": settings.CHUNK_WORDS, "overlap_rate": settings.CHUNK_OVERLAP,
+                    "tokenizer": "standard", "max_chunk_limit": settings.MAX_CHUNKS}},
+                "field_map": {CHUNK_SOURCE_FIELD: index_mod.CHUNK_FIELD},
+            }},
+            {"remove": {"field": CHUNK_SOURCE_FIELD, "ignore_missing": True}},
+            # No passages (no text): drop any vectors carried over from the
+            # stored document by an update_by_query, which would otherwise
+            # stay searchable and break the next write's skip_existing.
+            {"script": {
+                "source": "if (ctx[params.chunks] == null || ctx[params.chunks].isEmpty()) "
+                          "{ ctx.remove(params.vectors); }",
+                "params": {"chunks": index_mod.CHUNK_FIELD, "vectors": index_mod.VECTOR_FIELD},
+            }},
+            {"text_embedding": {
+                "model_id": model_id,
+                # Reuse stored vectors when the passages haven't changed, so
+                # role-only updates (acl sync) don't re-embed anything.
+                "skip_existing": True,
+                "field_map": {index_mod.CHUNK_FIELD: index_mod.VECTOR_FIELD},
+            }},
+        ],
+    })
+    _request("PUT", f"/_search/pipeline/{settings.SEARCH_PIPELINE}", {
+        "description": "Pelican: model id for neural queries, score blending for hybrid ones",
+        "request_processors": [{"neural_query_enricher": {"default_model_id": model_id}}],
+        "phase_results_processors": [{"normalization-processor": {
+            "normalization": {"technique": "min_max"},
+            "combination": {"technique": "arithmetic_mean", "parameters": {"weights": [0.5, 0.5]}},
+        }}],
+    })
+
+    for old in old_models:
+        ml("POST", f"models/{old}/_undeploy", {}, ok_missing=True)
+        ml("DELETE", f"models/{old}", ok_missing=True)
+    for old in old_connectors:
+        ml("DELETE", f"connectors/{old}", ok_missing=True)
+    print(f"[vector] {settings.EMBEDDINGS_MODEL} at {url}: model {model_id}, "
+          f"pipelines {settings.INGEST_PIPELINE} / {settings.SEARCH_PIPELINE}"
+          f"{f', replaced {len(old_models)} older model(s)' if old_models else ''}")
+
+
+def _wait_until_embeds(predict) -> None:
+    """Deploying is asynchronous, and the embeddings server downloads its
+    model on first start, so retry a test embedding for a while."""
+    deadline = time.monotonic() + VECTOR_WAIT_SECONDS
+    while True:
+        try:
+            out = predict()
+            dim = out["inference_results"][0]["output"][0]["shape"][0]
+            if dim != settings.VECTOR_DIMENSION:
+                sys.exit(f"[vector] {settings.EMBEDDINGS_MODEL} returns {dim} dimensions, "
+                         f"vector.dimension is {settings.VECTOR_DIMENSION}")
+            return
+        except RuntimeError as exc:
+            if time.monotonic() > deadline:
+                sys.exit(f"[vector] no embeddings from {settings.EMBEDDINGS_URL} after "
+                         f"{VECTOR_WAIT_SECONDS}s: {exc}")
+            print(f"[vector] waiting for the embeddings server: {str(exc)[:200]}")
+            time.sleep(10)
 
 
 def setup_snapshots(index: str) -> None:
