@@ -100,7 +100,9 @@ Tuning (all optional): `BATCH_SIZE`, `SMB_WORKERS`, `GRAPH_WORKERS`,
 `SP_WORKERS`, `ACL_SYNC_WORKERS`, `ACL_RECHECK_HOURS`, `PDF_TIMEOUT_SECONDS`,
 `WATCHDOG_TIMEOUT_SECONDS`, `SMB_CONNECT_TIMEOUT_SECONDS`,
 `SMB_LIST_TIMEOUT_SECONDS`, `SMB_FETCH_TIMEOUT_SECONDS`,
-`SMB_LIST_STALL_SECONDS`, `GRAPH_MAX_RETRIES`.
+`SMB_LIST_STALL_SECONDS`, `GRAPH_MAX_RETRIES`, `MAX_CONTENT_CHARS` (text
+kept per document, default 10 million characters; OpenSearch refuses more
+than 50 million).
 
 All three images run as UID 10001, not root. Anything you mount (config,
 `secrets/exo.pfx`, the state, status and permissions volumes) must be

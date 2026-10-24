@@ -9,6 +9,7 @@ per crawler (settings.HOST_*).
 
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -17,6 +18,10 @@ from opensearchpy import OpenSearch, helpers
 from . import settings
 
 SEARCH_INDEX = settings.SEARCH_INDEX
+# OpenSearch refuses any JSON string over 50 million characters, so a huge
+# text file would fail on every crawl (and, through an ingest pipeline, take
+# others in its bulk batch with it). Its text is cut to this length.
+MAX_CONTENT_CHARS = int(os.environ.get("MAX_CONTENT_CHARS", "10000000"))
 
 client = OpenSearch(
     hosts=[settings.OS_HOST],
@@ -100,6 +105,9 @@ def build_doc(url: str, filename: str, text: str, roles: list[str], raw_size: in
     acl_group  SMB only -- see acl_sync"""
     real_modified = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(file_mtime_epoch))
     ext = Path(filename).suffix.lstrip(".").lower() or "other"
+    if text and len(text) > MAX_CONTENT_CHARS:
+        print(f"  '{filename}': keeping the first {MAX_CONTENT_CHARS:,} of {len(text):,} characters of text")
+        text = text[:MAX_CONTENT_CHARS]
     source = {
         "url": url,
         "share": share_name,
