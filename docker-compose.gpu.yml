@@ -1,0 +1,19 @@
+# Runs the vector search `embeddings` service on an NVIDIA GPU. Needs the
+# NVIDIA driver and Container Toolkit on the host. Add it after the example:
+#
+#   docker compose -f docker-compose.example.yml -f docker-compose.gpu.yml up -d
+#
+# or set COMPOSE_FILE=docker-compose.example.yml:docker-compose.gpu.yml in .env.
+#
+# The image is built per GPU generation; set EMBEDDINGS_IMAGE in .env if
+# yours isn't an RTX 30xx / A10 / A40 (86-):
+#   turing-1.9.4   T4, RTX 20xx         89-1.9.4      L4, L40, RTX 40xx
+#   1.9.4          A100, A30            hopper-1.9.4  H100, H200
+#   100-1.9.4      B200                 120-1.9.4     RTX 50xx
+services:
+  embeddings:
+    image: ${EMBEDDINGS_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:86-1.9.4}
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]

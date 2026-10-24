@@ -35,6 +35,44 @@ client = OpenSearch(
 )
 
 
+# Vector search (settings.VECTOR_ENABLED): the ingest pipeline splits
+# `content` into CHUNK_FIELD and embeds each passage into VECTOR_FIELD, one
+# nested {"knn": [...]} object per passage. Crawlers never write either.
+CHUNK_FIELD = "content_chunks"
+VECTOR_FIELD = "content_embedding"
+# The pipeline splits a copy of `content` cut to this many characters --
+# room for max_chunks passages of chunk_words words at up to 8 characters a
+# word -- so a huge document can't exceed the analyzer's token limit, which
+# is raised to match (a token is at least one character).
+CHUNK_SOURCE_CHARS = settings.MAX_CHUNKS * settings.CHUNK_WORDS * 8
+
+
+def add_vector_mapping(mapping: dict) -> None:
+    """Extend the index body from search_index_mapping.json for vector
+    search: kNN on, the embedding pipeline run on every write (including
+    roles.py's update_by_query, where it reuses existing vectors when the
+    content hasn't changed), and the search pipeline that supplies the model
+    id to neural queries and blends hybrid scores."""
+    mapping.setdefault("settings", {}).update({
+        "index.knn": True,
+        "index.default_pipeline": settings.INGEST_PIPELINE,
+        "index.search.default_pipeline": settings.SEARCH_PIPELINE,
+        "index.analyze.max_token_count": CHUNK_SOURCE_CHARS,
+    })
+    mapping.setdefault("mappings", {}).setdefault("properties", {}).update({
+        # Kept only so the pipeline can tell unchanged passages apart; not searched.
+        CHUNK_FIELD: {"type": "text", "index": False},
+        VECTOR_FIELD: {
+            "type": "nested",
+            "properties": {"knn": {
+                "type": "knn_vector",
+                "dimension": settings.VECTOR_DIMENSION,
+                "method": {"name": "hnsw", "engine": "faiss", "space_type": "cosinesimil"},
+            }},
+        },
+    })
+
+
 def ensure_index_exists() -> None:
     """Create the index with our own explicit mapping if it doesn't exist
     yet -- makes a fresh OpenSearch instance self-sufficient on first run,
@@ -51,12 +89,19 @@ def ensure_index_exists() -> None:
         try:
             real_mapping = client.indices.get_mapping(index=SEARCH_INDEX)
             print(f"[bootstrap] index already exists, current mapping: {json.dumps(real_mapping)}")
+            has_vectors = VECTOR_FIELD in real_mapping[SEARCH_INDEX]["mappings"].get("properties", {})
+            if settings.VECTOR_ENABLED and not has_vectors:
+                print(f"[bootstrap] WARNING: vector.enabled is on but '{SEARCH_INDEX}' was created without "
+                      f"vectors -- new documents won't be embedded until the index is recreated")
         except Exception as exc:
             print(f"[bootstrap] index exists but get_mapping failed: {exc}")
         return
     with open(settings.INDEX_MAPPING_PATH) as f:
         mapping = json.load(f)
-    print(f"[bootstrap] index does not exist -- attempting to create with our mapping")
+    if settings.VECTOR_ENABLED:
+        add_vector_mapping(mapping)
+    print(f"[bootstrap] index does not exist -- attempting to create with our mapping"
+          f"{' (with vectors)' if settings.VECTOR_ENABLED else ''}")
     try:
         client.indices.create(index=SEARCH_INDEX, body=mapping)
         print(f"[bootstrap] Created index '{SEARCH_INDEX}' with purpose-built mapping")

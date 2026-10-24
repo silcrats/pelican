@@ -63,6 +63,34 @@ sources:
   exchange: exchange-online
   sharepoint: sharepoint-online
 
+# ---------------------------------------------------------------------
+# Vector (semantic) search. Off by default. When on, OpenSearch splits each
+# document's content into passages and embeds them as it indexes them,
+# calling a Text Embeddings Inference server (the compose example's
+# `embeddings` service, in the `vector` profile). The opensearch-users job
+# sets up the connector, model and pipelines; crawlers are unchanged.
+#
+# Only takes effect on an index created while it's on: an existing index
+# keeps its mapping, so delete it (and the crawlers' state) and re-crawl
+# to add vectors. Changing the model or dimension needs the same. A search
+# UI must also send vector queries (Frogmouth: vector.enabled).
+# ---------------------------------------------------------------------
+vector:
+  enabled: "${VECTOR_ENABLED:-false}"
+  # The TEI /embed endpoint, and the API key it was started with (API_KEY).
+  # OpenSearch is only allowed to call this URL.
+  embeddings_url: "${EMBEDDINGS_URL:-http://embeddings/embed}"
+  api_key: "${EMBEDDINGS_API_KEY}"
+  # Must match the model the embeddings server runs, and its output size.
+  model: "${EMBEDDINGS_MODEL:-BAAI/bge-base-en-v1.5}"
+  dimension: 768
+  # Passage size in words (the model reads at most 512 tokens, about 380
+  # words), overlap between neighbouring passages, and the most passages
+  # embedded per document -- text beyond that is still keyword-searchable.
+  chunk_words: 300
+  chunk_overlap: 0.1
+  max_chunks: 100
+
 # Incremental-crawl state (SQLite). Give every crawler container its own
 # volume; an SMB crawler and its ACL-sync container share one.
 state:
