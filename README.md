@@ -309,8 +309,8 @@ VECTOR=1 tests/integration/run.sh     # the same, with vector search on
 ```
 
 builds the images from your checkout and runs the compose example with a
-test Samba server: a real SMB crawl (text, Word and PDF extraction, ACL
-roles, exclusions), the ACL sync, every OpenSearch account's permissions,
+test Samba server: a real SMB crawl (text, Word and PDF extraction, photo
+EXIF and GPS, ACL roles, exclusions), the ACL sync, every OpenSearch account's permissions,
 the status page sign-in, snapshots and the scheduler proxy. It uses its
 own project name, volumes and ports, so it can run next to a real
 deployment. With `VECTOR=1` it also starts the CPU embeddings service

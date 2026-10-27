@@ -11,6 +11,7 @@ import os
 import sys
 
 from docx import Document
+from PIL import ExifTags, Image
 
 EXPECTED = {
     "Finance/notes.txt": "Pelican plain text fixture",
@@ -28,6 +29,20 @@ OFFICE = {
     "Finance/report.rtf": "Ελληνικά 中文",
 }
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+# A photo with EXIF camera, date taken (with its UTC offset) and GPS, which
+# the crawler reads with Pillow: run.sh checks the values it indexes.
+PHOTO = "Finance/photo.jpg"
+
+
+def write_photo(path: str) -> None:
+    exif = Image.Exif()
+    exif[0x010F], exif[0x0110] = "Canon", "EOS 5D"           # Make, Model
+    sub = exif.get_ifd(ExifTags.IFD.Exif)
+    sub[0x9003], sub[0x9011] = "2007:06:15 14:30:00", "+10:00"  # DateTimeOriginal, OffsetTimeOriginal
+    gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
+    gps[1], gps[2] = "S", (33.0, 51.0, 54.5)                  # Sydney
+    gps[3], gps[4] = "E", (151.0, 12.0, 35.6)
+    Image.new("RGB", (64, 48), (120, 160, 200)).save(path, "JPEG", exif=exif)
 
 
 def write_pdf(path: str, text: str) -> None:
@@ -73,10 +88,12 @@ def main(root: str) -> None:
         with gzip.open(os.path.join(FIXTURES_DIR, os.path.basename(rel) + ".gz")) as src, open(path, "wb") as out:
             out.write(src.read())
         os.chmod(path, 0o644)
+    write_photo(os.path.join(root, PHOTO))
+    os.chmod(os.path.join(root, PHOTO), 0o644)
     # Excluded by config/shares.yaml's exclude_extensions: must not be indexed.
     with open(os.path.join(root, "Finance", "skip.zip"), "wb") as f:
         f.write(b"PK\x05\x06" + b"\0" * 18)
-    print(f"wrote {len(EXPECTED) + len(OFFICE) + 1} files under {root}/Finance")
+    print(f"wrote {len(EXPECTED) + len(OFFICE) + 2} files under {root}/Finance")
 
 
 if __name__ == "__main__":

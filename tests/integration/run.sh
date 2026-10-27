@@ -106,6 +106,29 @@ EOF
 }
 check "Samba on default settings: each fixture indexed with its text and ACL roles" fixtures_indexed test-finance
 check "Samba requiring encryption, share with encrypt: true: each fixture indexed" fixtures_indexed test-encrypted
+
+# The photo's EXIF, read with Pillow: camera, date taken converted to UTC
+# from its offset (it becomes the document's timestamp), GPS and the place
+# name reverse-geocoded from it.
+photo_metadata_indexed() {
+  os_admin "https://localhost:9200/documents/_search?size=1" \
+    -d '{"query": {"bool": {"filter": [{"term": {"share": "test-finance"}}, {"term": {"filename.keyword": "photo.jpg"}}]}}}' > "$HITS"
+  python3 - "$HITS" <<'EOF'
+import json, sys
+hits = json.load(open(sys.argv[1]))["hits"]["hits"]
+doc = hits[0]["_source"] if hits else {}
+checks = {
+    "camera": (doc.get("image_camera_make"), doc.get("image_camera_model")) == ("Canon", "EOS 5D"),
+    "date taken": doc.get("timestamp") == "2007-06-15T04:30:00.000Z",
+    "GPS": abs((doc.get("image_gps_lat") or 0) + 33.8651) < 0.001 and abs((doc.get("image_gps_lon") or 0) - 151.2099) < 0.001,
+    "place": "Sydney" in (doc.get("image_location") or ""),
+}
+print("     photo.jpg:", ", ".join(f"{k} {'ok' if v else 'WRONG'}" for k, v in checks.items()) if doc else "MISSING")
+print("      ", {k: doc.get(k) for k in ("image_camera_make", "image_camera_model", "timestamp", "image_gps_lat", "image_gps_lon", "image_location")})
+sys.exit(0 if doc and all(checks.values()) else 1)
+EOF
+}
+check "photo indexed with its EXIF camera, date taken, GPS and place" photo_metadata_indexed
 # Otherwise the check above proves nothing: a client that can't encrypt
 # (SMB 2.1) must be refused by samba-encrypted.
 encryption_enforced() {
