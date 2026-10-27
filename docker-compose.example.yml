@@ -229,7 +229,7 @@ services:
   # include environment variables, so ofelia can still read the jobs'
   # credentials -- but not create or change containers.
   docker-api-proxy:
-    image: haproxy:3.2.25
+    image: haproxy:3.2.26
     user: "0"   # to open the Docker socket
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
