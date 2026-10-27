@@ -105,7 +105,8 @@ Tuning (all optional): `BATCH_SIZE`, `SMB_WORKERS`, `GRAPH_WORKERS`,
 `SMB_LIST_TIMEOUT_SECONDS`, `SMB_FETCH_TIMEOUT_SECONDS`,
 `SMB_LIST_STALL_SECONDS`, `GRAPH_MAX_RETRIES`, `MAX_CONTENT_CHARS` (text
 kept per document, default 10 million characters; OpenSearch refuses more
-than 50 million).
+than 50 million), `BULK_MAX_MB` (largest bulk request, default 10).
+`OS_HEAP` sets the compose example's OpenSearch heap (default `2g`).
 
 All three images run as UID 10001, not root. Anything you mount (config,
 `secrets/exo.pfx`, the state, status and permissions volumes) must be
@@ -205,6 +206,7 @@ To turn it on, before the first crawl, add to `.env`:
 VECTOR_ENABLED=true
 COMPOSE_PROFILES=vector                    # starts the embeddings service
 EMBEDDINGS_API_KEY=<long random string>    # e.g. openssl rand -hex 24
+OS_HEAP=4g                                 # OpenSearch heap; see below
 ```
 
 The `embeddings` service runs Hugging Face Text Embeddings Inference, on
@@ -236,6 +238,12 @@ Things to know:
 - **Access changes don't re-embed.** The ACL sync's role updates go through
   the pipeline, which reuses a document's stored vectors when its text
   hasn't changed. A changed file is embedded again.
+- **OpenSearch needs more memory.** Re-indexing a changed document holds
+  its stored text and vectors alongside the new ones, so a crawl that
+  re-indexes large files can trip OpenSearch's memory limit at the default
+  2 GB heap. Set `OS_HEAP` to 4g or more (half the host's free RAM at most).
+  Pelican also sends bulk writes in requests of at most `BULK_MAX_MB` (10)
+  and retries any OpenSearch refuses for memory, after a pause.
 - **The embeddings service is now in the indexing path.** If it's down,
   bulk writes fail and the crawl reports the share as failed, to be retried
   on the next run.

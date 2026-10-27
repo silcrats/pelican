@@ -22,6 +22,8 @@ SEARCH_INDEX = settings.SEARCH_INDEX
 # text file would fail on every crawl (and, through an ingest pipeline, take
 # others in its bulk batch with it). Its text is cut to this length.
 MAX_CONTENT_CHARS = int(os.environ.get("MAX_CONTENT_CHARS", "10000000"))
+# Largest bulk request sent (see bulk_index).
+BULK_MAX_BYTES = int(os.environ.get("BULK_MAX_MB", "10")) * 1024 * 1024
 
 client = OpenSearch(
     hosts=[settings.OS_HOST],
@@ -196,7 +198,14 @@ def build_doc(url: str, filename: str, text: str, roles: list[str], raw_size: in
 
 
 def bulk_index(actions: list[dict]) -> None:
-    helpers.bulk(client, actions)
+    """Write a batch, split into requests of at most BULK_MAX_BYTES (a
+    larger document goes alone). With vector search, OpenSearch holds each
+    re-indexed document's stored copy (text and vectors) next to the new one
+    while it runs the pipeline, so one request of several large files can
+    trip its memory circuit breaker; a request or document refused like that
+    (429) is retried after a pause (5, 10, 20, 40s)."""
+    helpers.bulk(client, actions, max_chunk_bytes=BULK_MAX_BYTES,
+                 max_retries=4, initial_backoff=5, max_backoff=60)
 
 
 def delete_docs(id_keys) -> None:
