@@ -75,6 +75,19 @@ def add_vector_mapping(mapping: dict) -> None:
     })
 
 
+def add_missing_fields(existing: dict) -> None:
+    """Add fields from search_index_mapping.json that an index made by an older
+    Pelican lacks, before anything is written to them: otherwise OpenSearch
+    would guess, and a guessed type can't be changed without a reindex. Only
+    adds; a field already there is never touched."""
+    with open(settings.INDEX_MAPPING_PATH) as f:
+        wanted = json.load(f)["mappings"]["properties"]
+    missing = {name: spec for name, spec in wanted.items() if name not in existing}
+    if missing:
+        client.indices.put_mapping(index=SEARCH_INDEX, body={"properties": missing})
+        print(f"[bootstrap] added to '{SEARCH_INDEX}': {', '.join(sorted(missing))}")
+
+
 def ensure_index_exists() -> None:
     """Create the index with our own explicit mapping if it doesn't exist
     yet -- makes a fresh OpenSearch instance self-sufficient on first run,
@@ -91,12 +104,14 @@ def ensure_index_exists() -> None:
         try:
             real_mapping = client.indices.get_mapping(index=SEARCH_INDEX)
             print(f"[bootstrap] index already exists, current mapping: {json.dumps(real_mapping)}")
-            has_vectors = VECTOR_FIELD in real_mapping[SEARCH_INDEX]["mappings"].get("properties", {})
+            properties = real_mapping[SEARCH_INDEX]["mappings"].get("properties", {})
+            add_missing_fields(properties)
+            has_vectors = VECTOR_FIELD in properties
             if settings.VECTOR_ENABLED and not has_vectors:
                 print(f"[bootstrap] WARNING: vector.enabled is on but '{SEARCH_INDEX}' was created without "
                       f"vectors -- new documents won't be embedded until the index is recreated")
         except Exception as exc:
-            print(f"[bootstrap] index exists but get_mapping failed: {exc}")
+            print(f"[bootstrap] index exists but reading or updating its mapping failed: {exc}")
         return
     with open(settings.INDEX_MAPPING_PATH) as f:
         mapping = json.load(f)
@@ -135,7 +150,8 @@ _MIME_TYPES = {
 }
 
 # Optional fields copied from extract_text()'s metadata when present.
-_EMAIL_FIELDS = ("email_from", "email_to", "email_cc", "email_subject", "email_attachments", "email_message_id")
+_EMAIL_FIELDS = ("email_from", "email_to", "email_cc", "email_subject", "email_attachments", "email_message_id",
+                 "email_thread_id", "email_in_reply_to", "email_references", "email_thread_index")
 _IMAGE_FIELDS = ("image_camera_make", "image_camera_model", "image_location")
 _IMAGE_NUMERIC_FIELDS = ("image_gps_lat", "image_gps_lon")   # 0.0 is a real value, so presence not truthiness
 

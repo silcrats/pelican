@@ -4,9 +4,11 @@ everything runs in-process so mailbox/document content never leaves this
 container.
 """
 
+import base64
 import email
 import io
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -62,6 +64,45 @@ def _parse_email_date(value) -> str | None:
         # malformed real-world Date headers -- and whatever it raises, the
         # contract here is "never raise, fall back to None" either way.
         return None
+
+
+_MESSAGE_ID = re.compile(r"<[^<>\s]+>")
+_MAX_REFERENCES = 100
+_THREAD_INDEX_ROOT_BYTES = 22
+
+
+def _thread_metadata(get_header, message_id: str) -> dict:
+    """An email's place in its conversation, from its headers. get_header
+    returns a header's value by name. Never raises: a malformed header only
+    costs this message its thread, not its text.
+
+    email_thread_id is the conversation's first message as far as this one
+    alone can tell: the start of References, else the message it replies to,
+    else itself if it isn't a reply. A reply with no References to a reply
+    therefore has its parent's id, so a reader wanting whole threads should also
+    follow email_in_reply_to and email_references, which are stored as sent.
+    Outlook's Thread-Index is kept separately: its first 22 bytes are the same
+    across a conversation, even where the other headers were dropped."""
+    metadata: dict = {}
+    try:
+        references = _MESSAGE_ID.findall(str(get_header("References") or ""))[-_MAX_REFERENCES:]
+        in_reply_to = _MESSAGE_ID.findall(str(get_header("In-Reply-To") or ""))[:1]
+        own = _MESSAGE_ID.findall(str(message_id or ""))[:1]
+        if references:
+            metadata["email_references"] = references
+        if in_reply_to:
+            metadata["email_in_reply_to"] = in_reply_to[0]
+        root = (references or in_reply_to or own)[:1]
+        if root:
+            metadata["email_thread_id"] = root[0]
+        thread_index = "".join(str(get_header("Thread-Index") or "").split())
+        if thread_index:
+            decoded = base64.b64decode(thread_index, validate=True)
+            if len(decoded) >= _THREAD_INDEX_ROOT_BYTES:
+                metadata["email_thread_index"] = base64.b64encode(decoded[:_THREAD_INDEX_ROOT_BYTES]).decode()
+    except Exception as exc:
+        print(f"  could not read an email's thread headers: {exc}")
+    return metadata
 
 
 def _extract_eml(data: bytes) -> tuple[str, dict]:
@@ -123,6 +164,7 @@ def _extract_eml(data: bytes) -> tuple[str, dict]:
         metadata["email_attachments"] = attachments
     if message_id.strip():
         metadata["email_message_id"] = message_id.strip()
+    metadata.update(_thread_metadata(msg.get, message_id))
     metadata.update(_aggregate_image_attachments(image_metas))
     return text, metadata
 
@@ -331,6 +373,9 @@ def _extract_msg(data: bytes) -> tuple[str, dict]:
             metadata["email_date"] = email_date_iso
         if message_id.strip():
             metadata["email_message_id"] = message_id.strip()
+        # A .msg only has internet headers if it came from outside Exchange.
+        headers = getattr(msg, "header", None)
+        metadata.update(_thread_metadata(headers.get if headers else (lambda name: None), message_id))
         attachments = []
         image_metas: list[dict] = []
         for att in getattr(msg, "attachments", []) or []:
@@ -363,6 +408,7 @@ _LEGACY_POWERPOINT_EXTENSIONS = {"ppt", "pps", "pot"}
 # state.extraction_cutoffs). Never rename or remove an entry.
 EXTRACTION_REVISIONS: dict[str, set[str]] = {
     "2026-10-office-formats": _LEGACY_WORD_EXTENSIONS | _LEGACY_POWERPOINT_EXTENSIONS | {"pptx", "odt", "odp", "rtf"},
+    "2026-10-email-threads": {"eml", "msg"},
 }
 _PLAIN_TEXT_EXTENSIONS = {"txt", "md", "csv", "log", "json", "xml", "html", "htm", "yaml", "yml", "ini", "conf"}
 _IMAGE_EXTENSIONS = {"jpg", "jpeg", "tif", "tiff", "png", "webp"}

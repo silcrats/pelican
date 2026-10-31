@@ -28,6 +28,17 @@ OFFICE = {
     "Finance/report.odt": "Ελληνικά 中文",
     "Finance/report.rtf": "Ελληνικά 中文",
 }
+# Emails with each combination of thread headers, for the email_thread_* fields:
+# run.sh checks what's indexed for each. Thread-Index is 27 bytes of base64.
+THREAD_INDEX = "Ac8AAAECAwQFBgcICQoLDA0ODxAREhMUFRYX"
+EMAILS = {
+    "Finance/thread-start.eml": "Message-ID: <root@test>\n",
+    "Finance/thread-reply.eml": "Message-ID: <reply@test>\nIn-Reply-To: <root@test>\nReferences: <root@test>\n",
+    "Finance/thread-reply-2.eml": "Message-ID: <reply2@test>\nIn-Reply-To: <reply@test>\nReferences: <root@test>\n <reply@test>\n",
+    "Finance/thread-parent-only.eml": "Message-ID: <child@test>\nIn-Reply-To: <parent@test>\n",
+    "Finance/thread-outlook.eml": f"Message-ID: <outlook@test>\nThread-Index: {THREAD_INDEX}\n",
+    "Finance/thread-bad-headers.eml": "Message-ID: <bad@test>\nIn-Reply-To: not an id\nThread-Index: !!not base64!!\n",
+}
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 # A photo with EXIF camera, date taken (with its UTC offset) and GPS, which
 # the crawler reads with Pillow: run.sh checks the values it indexes.
@@ -88,12 +99,17 @@ def main(root: str) -> None:
         with gzip.open(os.path.join(FIXTURES_DIR, os.path.basename(rel) + ".gz")) as src, open(path, "wb") as out:
             out.write(src.read())
         os.chmod(path, 0o644)
+    for rel, headers in EMAILS.items():
+        path = os.path.join(root, rel)
+        with open(path, "w") as f:
+            f.write(f"{headers}From: a@test\nTo: b@test\nSubject: Fixture thread\n\nPelican email fixture {os.path.basename(rel)}\n")
+        os.chmod(path, 0o644)
     write_photo(os.path.join(root, PHOTO))
     os.chmod(os.path.join(root, PHOTO), 0o644)
     # Excluded by config/shares.yaml's exclude_extensions: must not be indexed.
     with open(os.path.join(root, "Finance", "skip.zip"), "wb") as f:
         f.write(b"PK\x05\x06" + b"\0" * 18)
-    print(f"wrote {len(EXPECTED) + len(OFFICE) + 2} files under {root}/Finance")
+    print(f"wrote {len(EXPECTED) + len(OFFICE) + len(EMAILS) + 2} files under {root}/Finance")
 
 
 if __name__ == "__main__":

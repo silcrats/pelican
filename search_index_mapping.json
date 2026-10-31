@@ -40,6 +40,10 @@
         "fields": { "keyword": { "type": "keyword", "ignore_above": 512 } }
       },
       "email_message_id": { "type": "keyword" },
+      "email_thread_id": { "type": "keyword" },
+      "email_in_reply_to": { "type": "keyword" },
+      "email_references": { "type": "keyword" },
+      "email_thread_index": { "type": "keyword" },
       "image_camera_make": { "type": "keyword" },
       "image_camera_model": { "type": "keyword" },
       "image_gps_lat": { "type": "float" },

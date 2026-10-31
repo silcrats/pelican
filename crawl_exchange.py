@@ -34,7 +34,7 @@ import requests
 
 from pelican import roles as role_store
 from pelican import settings, state, status
-from pelican.extract_text import extract_text
+from pelican.extract_text import EXTRACTION_REVISIONS, extract_text
 from pelican.graph_client import GraphClient
 from pelican.index import SEARCH_INDEX, build_doc, bulk_index, client, delete_docs, ensure_index_exists
 from pelican.watchdog import heartbeat, start_watchdog
@@ -433,6 +433,10 @@ def process_mailbox(mb: dict, state_db: sqlite3.Connection) -> int:
         if len(actions) >= BATCH_SIZE:
             flush_batch()
 
+    # Every message is extracted as an .eml. A delta query only lists what's
+    # changed, so older messages catch up at the folder's next full enumeration.
+    reextract_before = state.extraction_cutoffs(state_db, EXTRACTION_REVISIONS)[0].get("eml")
+
     with ThreadPoolExecutor(max_workers=GRAPH_WORKERS) as executor:
         max_in_flight = GRAPH_WORKERS * 4
 
@@ -471,7 +475,7 @@ def process_mailbox(mb: dict, state_db: sqlite3.Connection) -> int:
                         last_report = time.time()
 
                     mtime = _epoch(msg.get("receivedDateTime"))
-                    if state.is_unchanged(state_db, state_key, mtime):
+                    if state.is_unchanged(state_db, state_key, mtime, reextract_before):
                         skipped_unchanged += 1
                         continue
 
