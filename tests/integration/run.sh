@@ -78,8 +78,68 @@ check "crawler account can do a crawl's operations, and no more" \
   /tests/check_crawler_account.py
 
 echo "== SMB crawl"
-check "crawl_smb.py exits 0" "${COMPOSE[@]}" run --rm --no-deps crawl-smb
+# Without vectors, start from an index as an older Pelican made it, so that this
+# run covers upgrading one, with the crawler's own permissions. With vectors,
+# the crawler creates the index itself.
+if [ "${VECTOR:-}" != 1 ]; then
+  python3 -c '
+import json
+m = json.load(open("search_index_mapping.json"))
+for f in ("email_thread_id", "email_in_reply_to", "email_references", "email_thread_index"):
+    del m["mappings"]["properties"][f]
+print(json.dumps(m))' > "$HITS"
+  # The account check above has already created the index.
+  os_admin -XDELETE https://localhost:9200/documents >/dev/null
+  created=$(os_admin -XPUT https://localhost:9200/documents -d @- < "$HITS")
+  check "an index as an older Pelican made it, without thread fields, is in place" grep -q '"acknowledged":true' <<< "$created"
+fi
+crawl_out=$("${COMPOSE[@]}" run --rm --no-deps crawl-smb 2>&1); crawl_rc=$?
+check "crawl_smb.py exits 0" test "$crawl_rc" = 0
 os_admin -XPOST https://localhost:9200/documents/_refresh >/dev/null
+
+thread_fields_mapped() {
+  os_admin https://localhost:9200/documents/_mapping > "$HITS"
+  python3 - "$HITS" <<'EOF'
+import json, sys
+props = json.load(open(sys.argv[1]))["documents"]["mappings"]["properties"]
+fields = ("email_thread_id", "email_in_reply_to", "email_references", "email_thread_index")
+types = {f: props.get(f, {}).get("type") for f in fields}
+print(f"     {types}")
+sys.exit(0 if all(t == "keyword" for t in types.values()) else 1)
+EOF
+}
+check "thread fields are keywords, whether the index was new or upgraded" thread_fields_mapped
+if [ "${VECTOR:-}" != 1 ]; then
+  check "the crawler account added them to an older index" grep -q "added to 'documents': email_in_reply_to" <<< "$crawl_out"
+fi
+
+thread_fields_indexed() {
+  os_admin "https://localhost:9200/documents/_search?size=20" \
+    -d '{"query": {"bool": {"filter": [{"term": {"share": "test-finance"}}, {"term": {"filetype": "eml"}}]}}}' > "$HITS"
+  python3 - "$HITS" <<'EOF'
+import json, sys
+docs = {h["_source"]["filename"]: h["_source"] for h in json.load(open(sys.argv[1]))["hits"]["hits"]}
+index_root = "Ac8AAAECAwQFBgcICQoLDA0ODxAREg=="
+expected = {
+    "thread-start.eml": {"email_thread_id": "<root@test>"},
+    "thread-reply.eml": {"email_thread_id": "<root@test>", "email_in_reply_to": "<root@test>", "email_references": ["<root@test>"]},
+    "thread-reply-2.eml": {"email_thread_id": "<root@test>", "email_in_reply_to": "<reply@test>", "email_references": ["<root@test>", "<reply@test>"]},
+    "thread-parent-only.eml": {"email_thread_id": "<parent@test>", "email_in_reply_to": "<parent@test>"},
+    "thread-outlook.eml": {"email_thread_id": "<outlook@test>", "email_thread_index": index_root},
+    "thread-bad-headers.eml": {"email_thread_id": "<bad@test>"},
+}
+fields = ("email_thread_id", "email_in_reply_to", "email_references", "email_thread_index")
+ok = True
+for name, want in expected.items():
+    doc = docs.get(name, {})
+    got = {f: doc[f] for f in fields if f in doc}
+    good = got == want and f"Pelican email fixture {name}" in doc.get("content", "")
+    print(f"     {name}: {'ok' if good else f'MISMATCH {got}'}")
+    ok &= good
+sys.exit(0 if ok else 1)
+EOF
+}
+check "each email's thread fields are indexed, and bad headers cost only those fields" thread_fields_indexed
 
 fixtures_indexed() {  # fixtures_indexed <share name>
   os_admin "https://localhost:9200/documents/_search?size=20" \
@@ -207,6 +267,23 @@ office_files_reextracted() {
 }
 check "files indexed before Office extraction existed are extracted once, nothing else re-fetched" \
   office_files_reextracted
+
+# Likewise emails indexed before thread fields existed.
+emails_reextracted() {
+  local rewound out
+  rewound=$("${COMPOSE[@]}" run --rm --no-deps -e PYTHONPATH=/app --entrypoint python crawl-smb \
+    /tests/rewind_email_files.py 2>/dev/null | tail -1)
+  [ "$rewound" = 12 ] || { echo "     expected 12 state rows rewound, got '$rewound'"; return 1; }
+  os_admin -XPOST "https://localhost:9200/documents/_update_by_query?refresh=true" -d '{
+    "query": {"term": {"filetype": "eml"}},
+    "script": {"source": "for (f in [\u0027email_thread_id\u0027, \u0027email_in_reply_to\u0027, \u0027email_references\u0027, \u0027email_thread_index\u0027]) { ctx._source.remove(f) }"}}' >/dev/null
+  out=$("${COMPOSE[@]}" run --rm --no-deps crawl-smb 2>&1)
+  grep -E "finished|skipped [0-9]+ unchanged" <<< "$out" | sed 's/^/     /'
+  [ "$(grep -c "finished 'test-[a-z]*': 6 documents indexed" <<< "$out")" = 2 ] \
+    && os_admin -XPOST https://localhost:9200/documents/_refresh >/dev/null \
+    && thread_fields_indexed >/dev/null
+}
+check "emails indexed before thread fields existed are extracted once, and get them" emails_reextracted
 
 crawl_with_failing_share() {
   local out rc
