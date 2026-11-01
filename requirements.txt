@@ -373,9 +373,9 @@ ebcdic==2.0.1 \
 events==0.5 \
     --hash=sha256:a7286af378ba3e46640ac9825156c93bdba7502174dd696090fdfcd4d80a1abd
     # via opensearch-py
-extract-msg==0.56.1 \
-    --hash=sha256:3690ee28cbc5a8affa9c07d5e902464743949fcf2033f24b926d7c08485b42a9 \
-    --hash=sha256:de94121cf5503377d932d503280293837baf630cd51ce36de901936b3172c43a
+extract-msg==0.58.0 \
+    --hash=sha256:0fa72044ddfa0a7bc4493554ae7c8abc4bd0ee1050e283bbfe43d08584243c2a \
+    --hash=sha256:f705f5bcf78dd15906935bcac4426a7a39c3aa428006f56b90b89a295955c8f8
     # via -r requirements.in
 grpcio==1.84.0 \
     --hash=sha256:026d757df86c5b7a41de8200b9a2cda454aaa5004cb0c7e3374c66eb82f61499 \
