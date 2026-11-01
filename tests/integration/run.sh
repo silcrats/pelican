@@ -215,6 +215,12 @@ for h in hits:
     vectors = h["_source"].get("content_embedding") or []
     print(f"     {h['_source']['filename']}: {len(vectors)} passage vector(s)")
     ok &= bool(vectors) and all(len(v["knn"]) == 768 for v in vectors)
+    mean = h["_source"].get("content_embedding_mean") or []
+    expected = [sum(v["knn"][i] for v in vectors) for i in range(768)] if vectors else []
+    length = sum(x * x for x in expected) ** 0.5
+    close = len(mean) == 768 and all(abs(m - x / length) < 1e-4 for m, x in zip(mean, expected))
+    print(f"     {h['_source']['filename']}: document vector {'matches its passages' if close else 'WRONG'}")
+    ok &= close
 sys.exit(0 if ok else 1)
 EOF
   }

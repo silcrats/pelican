@@ -268,7 +268,7 @@ Any search UI reading the index must agree with `config/pelican.yaml`:
   `sharepoint-online`; `share` is the share, mailbox or site name.
 - **Index.** `opensearch.index`, created with `search_index_mapping.json` on
   first run.
-- **Vectors** (only with vector search on). `content_embedding` is a nested
+- **Vectors** (only with vector search on). `content_embedding_mean` is one vector for the whole document, the average of its passages. `content_embedding` is a nested
   field with one `{"knn": [...]}` object per passage of `content`; the
   index's default search pipeline fills in the model for `neural` queries
   and blends `hybrid` query scores.

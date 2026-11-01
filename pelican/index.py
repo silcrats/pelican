@@ -42,6 +42,11 @@ client = OpenSearch(
 # nested {"knn": [...]} object per passage. Crawlers never write either.
 CHUNK_FIELD = "content_chunks"
 VECTOR_FIELD = "content_embedding"
+# One vector for the whole document: its passages' average, scaled to length 1.
+# Lets a client compare documents without downloading every passage's vector.
+# Kept in _source only, so it adds nothing to search or to the kNN graphs.
+DOC_VECTOR_FIELD = "content_embedding_mean"
+DOC_VECTOR_MAPPING = {"type": "float", "index": False, "doc_values": False}
 # The pipeline splits a copy of `content` cut to this many characters --
 # room for max_chunks passages of chunk_words words at up to 8 characters a
 # word -- so a huge document can't exceed the analyzer's token limit, which
@@ -64,6 +69,7 @@ def add_vector_mapping(mapping: dict) -> None:
     mapping.setdefault("mappings", {}).setdefault("properties", {}).update({
         # Kept only so the pipeline can tell unchanged passages apart; not searched.
         CHUNK_FIELD: {"type": "text", "index": False},
+        DOC_VECTOR_FIELD: DOC_VECTOR_MAPPING,
         VECTOR_FIELD: {
             "type": "nested",
             "properties": {"knn": {
@@ -82,6 +88,8 @@ def add_missing_fields(existing: dict) -> None:
     adds; a field already there is never touched."""
     with open(settings.INDEX_MAPPING_PATH) as f:
         wanted = json.load(f)["mappings"]["properties"]
+    if settings.VECTOR_ENABLED and VECTOR_FIELD in existing:
+        wanted = {**wanted, DOC_VECTOR_FIELD: DOC_VECTOR_MAPPING}
     missing = {name: spec for name, spec in wanted.items() if name not in existing}
     if missing:
         client.indices.put_mapping(index=SEARCH_INDEX, body={"properties": missing})

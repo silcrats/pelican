@@ -318,6 +318,12 @@ def setup_vector() -> None:
                 "skip_existing": True,
                 "field_map": {index_mod.CHUNK_FIELD: index_mod.VECTOR_FIELD},
             }},
+            # After embedding, so it sees reused vectors too. Runs on every write,
+            # which fills it in on documents whose passages haven't changed.
+            {"script": {
+                "source": DOC_VECTOR_SCRIPT,
+                "params": {"vectors": index_mod.VECTOR_FIELD, "mean": index_mod.DOC_VECTOR_FIELD},
+            }},
         ],
     })
     _request("PUT", f"/_search/pipeline/{settings.SEARCH_PIPELINE}", {
@@ -337,6 +343,29 @@ def setup_vector() -> None:
     print(f"[vector] {settings.EMBEDDINGS_MODEL} at {url}: model {model_id}, "
           f"pipelines {settings.INGEST_PIPELINE} / {settings.SEARCH_PIPELINE}"
           f"{f', replaced {len(old_models)} older model(s)' if old_models else ''}")
+
+
+# The passages' average, scaled to length 1, or nothing if there are no passages.
+DOC_VECTOR_SCRIPT = """
+def passages = ctx[params.vectors];
+ctx.remove(params.mean);
+if (passages != null && !passages.isEmpty()) {
+  double[] sum = null;
+  for (def passage : passages) {
+    def knn = passage.knn;
+    if (sum == null) { sum = new double[knn.size()]; }
+    for (int i = 0; i < sum.length; i++) { sum[i] += knn.get(i); }
+  }
+  double total = 0;
+  for (int i = 0; i < sum.length; i++) { total += sum[i] * sum[i]; }
+  double norm = Math.sqrt(total);
+  if (norm > 0) {
+    def mean = new ArrayList();
+    for (int i = 0; i < sum.length; i++) { mean.add((float) (sum[i] / norm)); }
+    ctx[params.mean] = mean;
+  }
+}
+"""
 
 
 def _wait_until_embeds(predict) -> None:
