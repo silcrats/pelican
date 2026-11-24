@@ -213,9 +213,9 @@ def build_doc(url: str, filename: str, text: str, roles: list[str], raw_size: in
     if acl_group is not None:
         source["acl_group"] = acl_group
 
-    # Serialized size of this document as indexed. Lets the status page work
-    # out how much of the index each source accounts for from measured sizes
-    # rather than a sample. Set last so it covers every field above.
+    # Serialized size of this document as indexed. Lets the admin portal's
+    # Storage page work out how much of the index each source accounts for
+    # from measured sizes rather than a sample. Set last so it covers every field above.
     source["doc_bytes"] = len(json.dumps(source, ensure_ascii=False).encode("utf-8"))
 
     return {"_index": SEARCH_INDEX, "_id": doc_id(id_key or url), "_source": source}

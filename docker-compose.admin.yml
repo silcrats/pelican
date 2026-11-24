@@ -1,0 +1,115 @@
+# Admin portal and workers, on top of the compose example:
+#
+#   docker compose -f docker-compose.example.yml -f docker-compose.admin.yml up -d
+#
+# Sources and schedules are then managed in the portal (http://localhost:8091)
+# instead of config/*.yaml and ofelia. On first start the portal imports
+# what's in config/shares.yaml, exchange.yaml and sharepoint.yaml.
+#
+# - admin: the portal. Signs people in against AD and holds no source
+#   credentials: it only says what to crawl.
+# - worker: runs the jobs the portal hands out (crawls, ACL syncs, tests,
+#   removals) with the credentials in .env. How many jobs each runs at once
+#   is set in the portal (Activity page); add workers with `--scale worker=3`.
+# - The per-job crawler containers move to the "yaml-jobs" profile (not
+#   started) and ofelia keeps only the mailbox permission export, which
+#   reads the exchange.yaml the portal writes.
+#
+# Needs in .env: WORKER_TOKEN (32+ random characters), and either the
+# LDAP_* settings with SUPER_ADMIN_GROUPS, or ADMIN_BREAKGLASS_PASSWORD. See the
+# README's "Admin portal" section.
+
+services:
+  admin:
+    image: ghcr.io/silcrats/pelican-admin:${PELICAN_VERSION:-latest}
+    build: ./admin
+    container_name: pelican-admin
+    # Not env_file: the portal gets only what it needs, none of the
+    # SMB, Graph or OpenSearch write credentials.
+    environment:
+      WORKER_TOKEN: ${WORKER_TOKEN:?set WORKER_TOKEN in .env (32+ random characters)}
+      LDAP_URL: ${LDAP_URL:-}
+      LDAP_BIND_TEMPLATE: ${LDAP_BIND_TEMPLATE:-}
+      LDAP_BASE_DN: ${LDAP_BASE_DN:-}
+      LDAP_USERNAME_ATTR: ${LDAP_USERNAME_ATTR:-sAMAccountName}
+      LDAP_START_TLS: ${LDAP_START_TLS:-false}
+      # A private CA for ldaps:// or StartTLS: mount it, e.g. ./secrets/ldap-ca.pem:/run/secrets/ldap-ca.pem:ro
+      LDAP_CA_FILE: ${LDAP_CA_FILE:-}
+      SUPER_ADMIN_GROUPS: ${SUPER_ADMIN_GROUPS:-}
+      ADMIN_BREAKGLASS_PASSWORD: ${ADMIN_BREAKGLASS_PASSWORD:-}
+      ADMIN_SECURE_COOKIE: ${ADMIN_SECURE_COOKIE:-false}
+      # Schedule for imported and new sources, in minutes; 0 = manual only.
+      DEFAULT_CRAWL_MINUTES: ${DEFAULT_CRAWL_MINUTES:-360}
+      DEFAULT_ACL_MINUTES: ${DEFAULT_ACL_MINUTES:-120}
+      # Read-only: the Storage page and the document count shown before a removal.
+      OS_HOST: https://opensearch:9200
+      OS_USERNAME: pelican-status
+      OS_PASSWORD: ${OS_STATUS_PASSWORD:?set OS_STATUS_PASSWORD in .env}
+      OS_CA_CERTS: /certs/ca.pem
+      TZ: ${TZ:-UTC}
+    volumes:
+      - admin-data:/data
+      - admin-export:/export
+      - ./config:/import:ro
+      - certs:/certs:ro
+    ports:
+      - "8091:8091"
+    networks: [search]
+    restart: unless-stopped
+
+  worker:
+    image: ghcr.io/silcrats/pelican:${PELICAN_VERSION:-latest}
+    build: .
+    entrypoint: ["python", "-u", "run_worker.py"]
+    env_file: .env
+    environment:
+      OS_HOST: https://opensearch:9200
+      OS_USERNAME: pelican
+      OS_CA_CERTS: /certs/ca.pem
+      ADMIN_URL: http://admin:8091
+    volumes:
+      # The same state volumes the one-shot crawlers used, so nothing is
+      # crawled again from scratch.
+      - state-smb:/state/smb
+      - state-exchange:/state/exchange
+      - state-sharepoint:/state/sharepoint
+      - status:/status
+      - exo-permissions:/perm:ro
+      - certs:/certs:ro
+    networks: [search]
+    depends_on:
+      admin:
+        condition: service_started
+      opensearch-users:
+        condition: service_completed_successfully
+    # Lets a running crawl finish its current batch on `docker compose stop`.
+    stop_grace_period: 60s
+    logging:
+      options: {max-size: "20m", max-file: "5"}
+    restart: unless-stopped
+
+  crawl-smb:
+    profiles: [yaml-jobs]
+  sync-smb-acl:
+    profiles: [yaml-jobs]
+  crawl-exchange:
+    profiles: [yaml-jobs]
+  crawl-sharepoint:
+    profiles: [yaml-jobs]
+
+  exo-permissions:
+    environment:
+      EXCHANGE_CONFIG: /export/exchange.yaml
+    volumes:
+      - admin-export:/export:ro
+
+  ofelia:
+    depends_on: !override [docker-api-proxy, exo-permissions]
+    labels: !override
+      # Hourly, so a Full Access change is picked up by the next mail crawl.
+      ofelia.job-run.exo-permissions.schedule: "@every 1h"
+      ofelia.job-run.exo-permissions.container: "pelican-exo-permissions"
+
+volumes:
+  admin-data:
+  admin-export:

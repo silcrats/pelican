@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Integration test: runs the compose example (secured OpenSearch, status
-# page, scheduler proxy) plus a test Samba server, crawls it, and checks
+# Integration test: runs the compose example (secured OpenSearch, scheduler
+# proxy) and the admin portal plus a test Samba server, crawls it, and checks
 # the results and the access controls. Builds the images from this checkout.
 #
 #   tests/integration/run.sh            from the repo root
@@ -21,8 +21,9 @@ fi
 
 PROJECT=pelican-itest
 COMPOSE=(docker compose -p "$PROJECT" -f docker-compose.example.yml -f tests/integration/compose.test.yml)
+ADMIN_COMPOSE=("${COMPOSE[@]}" -f docker-compose.admin.yml -f tests/integration/compose.admin-test.yml)
 ADMIN_PW='Itest-Owner-Pw-9!'
-STATUS_PW='Itest-Status-Page-Pw-1'
+BREAKGLASS_PW='Itest-Break-Glass-Pw-2'
 failures=0
 HITS=$(mktemp)
 
@@ -30,12 +31,13 @@ cat > .env <<EOF
 OS_PASSWORD='Itest-Crawler-Pw-7!'
 OS_STATUS_PASSWORD='Itest-Status-Pw-8!'
 OS_ADMIN_PASSWORD='$ADMIN_PW'
-STATUS_PASSWORD='$STATUS_PW'
 SMB_USER=pelican-test
 SMB_PASS=Smb-Test-Pw-1
 SMB_DOMAIN=
+WORKER_TOKEN=Itest-Worker-Token-0123456789abcdef
+ADMIN_BREAKGLASS_PASSWORD='$BREAKGLASS_PW'
 EOF
-SERVICES=(status samba samba-encrypted)
+SERVICES=(opensearch-users samba samba-encrypted)
 READER_PW='Itest-Reader-Pw-5!'
 if [ "${VECTOR:-}" = 1 ]; then
   cat >> .env <<EOF
@@ -49,7 +51,7 @@ fi
 
 cleanup() {
   if [ "${KEEP:-}" != 1 ]; then
-    "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1
+    "${ADMIN_COMPOSE[@]}" --profile yaml-jobs down -v --remove-orphans >/dev/null 2>&1
   fi
   rm -f .env "$HITS"
 }
@@ -66,10 +68,11 @@ os_admin() {
 }
 
 echo "== build"
-"${COMPOSE[@]}" build opensearch-certs status || exit 1
+"${COMPOSE[@]}" build opensearch-certs || exit 1
 
-echo "== start OpenSearch, accounts, status page, Samba"
+echo "== start OpenSearch, accounts, Samba"
 "${COMPOSE[@]}" up -d --no-build "${SERVICES[@]}" || { "${COMPOSE[@]}" logs; exit 1; }
+"${COMPOSE[@]}" wait opensearch-users >/dev/null || { "${COMPOSE[@]}" logs opensearch-users; exit 1; }
 "${COMPOSE[@]}" logs opensearch-users | grep -E '\[(users|vector|snapshots)\]'
 
 echo "== crawler account"
@@ -301,52 +304,7 @@ crawl_with_failing_share() {
 }
 check "a failed share makes the crawl exit non-zero, other shares still crawled" crawl_with_failing_share
 
-echo "== status page"
-STATUS=http://localhost:18090
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
-status_lists_job() { grep -q test-finance <<< "$(curl -s -u "pelican:$STATUS_PW" "$STATUS/status.json")"; }
-status_reads_index() {
-  curl -s -u "pelican:$STATUS_PW" "$STATUS/storage.json" | python3 -c '
-import json, sys
-s = json.load(sys.stdin)
-sys.exit(0 if not s.get("error") and (s.get("data") or {}).get("docs", 0) >= 3 else 1)'
-}
-# Browser flow: sign-in page and session cookie, never the browser's popup.
-COOKIES=$(mktemp)
-page_redirects_to_login() {
-  local headers
-  headers=$(curl -s -o /dev/null -D - "$STATUS/" | tr -d '\r')
-  grep -q "^HTTP/[0-9.]* 303" <<< "$headers" && grep -qi "^location: /login" <<< "$headers" \
-    && ! grep -qi "^www-authenticate" <<< "$headers"
-}
-wrong_password_refused() {
-  test "$(curl -s -o /dev/null -w '%{redirect_url}' -d 'username=pelican&password=wrong' "$STATUS/login")" \
-    = "$STATUS/login?failed=1"
-}
-sign_in_gives_session() {
-  curl -s -o /dev/null -c "$COOKIES" --data-urlencode username=pelican --data-urlencode "password=$STATUS_PW" \
-    "$STATUS/login"
-  grep -q test-finance <<< "$(curl -s -b "$COOKIES" "$STATUS/status.json")"
-}
-sign_out_ends_session() {
-  local token
-  token=$(awk '/pelican_status_session/ {print $7}' "$COOKIES")
-  curl -s -o /dev/null -b "$COOKIES" -X POST "$STATUS/logout"
-  test "$(code -b "pelican_status_session=$token" "$STATUS/status.json")" = 401
-}
-check "status page sends browsers to its sign-in page (no popup)" page_redirects_to_login
-check "status page data refuses requests without sign-in" test "$(code "$STATUS/status.json")" = 401
-check "status page sign-in refuses a wrong password" wrong_password_refused
-check "status page sign-in gives a session that reads the job list" sign_in_gives_session
-check "status page shows its version once signed in" \
-  grep -q 'class="version">dev<' <<< "$(curl -s -u "pelican:$STATUS_PW" "$STATUS/")"
-check "status page sign-out ends the session" sign_out_ends_session
-rm -f "$COOKIES"
-# Scripts: the same credentials as HTTP Basic.
-check "status page refuses a wrong password (Basic)" test "$(code -u pelican:wrong "$STATUS/status.json")" = 401
-check "status page lists the SMB job (Basic)" status_lists_job
-"${COMPOSE[@]}" restart status >/dev/null 2>&1; sleep 5   # storage view refreshes at start
-check "status page reads index stats with its account" status_reads_index
 
 echo "== OpenSearch access"
 anonymous_refused() {
@@ -375,10 +333,37 @@ check "proxy refuses creating containers" test "$(proxy POST /containers/create)
 check "proxy refuses exec" test "$(proxy POST /containers/pelican-crawl-smb/exec)" = 403
 check "proxy refuses image calls" test "$(proxy GET /images/json)" = 403
 
+echo "== admin portal and worker"
+# Last, since the admin overlay takes the one-shot crawlers out of the project.
+"${ADMIN_COMPOSE[@]}" build admin worker >/dev/null || failures=$((failures + 1))
+"${ADMIN_COMPOSE[@]}" up -d --no-build admin worker >/dev/null 2>&1
+portal_up() {
+  for _ in $(seq 30); do
+    [ "$(code http://localhost:18091/healthz)" = 200 ] && return 0
+    sleep 1
+  done
+  return 1
+}
+check "portal starts" portal_up
+admin_out=$(python3 tests/integration/admin_flow.py http://localhost:18091 "$BREAKGLASS_PW"); admin_rc=$?
+echo "$admin_out" | sed 's/^/  /'
+check "admin portal flow ($admin_rc failed)" test "$admin_rc" = 0
+removed_from_index() {
+  test "$(os_admin https://localhost:9200/documents/_count -d '{"query": {"term": {"share": "test-admin-added"}}}' \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["count"])')" = 0
+}
+check "removed source's documents are gone from the index" removed_from_index
+check "other sources' documents untouched by the removal" fixtures_indexed test-finance
+check "portal writes shares.yaml for Frogmouth" \
+  grep -q 'name: test-finance' <<< "$("${ADMIN_COMPOSE[@]}" exec -T admin cat /export/shares.yaml)"
+check "worker hides its portal token from jobs" \
+  test "$("${ADMIN_COMPOSE[@]}" logs worker 2>/dev/null | grep -c Itest-Worker-Token)" = 0
+
 echo
 if [ "$failures" -gt 0 ]; then
   echo "$failures check(s) failed"
-  "${COMPOSE[@]}" logs --tail 40 opensearch-users crawl-smb status samba 2>/dev/null
+  "${COMPOSE[@]}" logs --tail 40 opensearch-users crawl-smb samba 2>/dev/null
+  "${ADMIN_COMPOSE[@]}" logs --tail 60 admin worker 2>/dev/null
   exit 1
 fi
 echo "all checks passed"

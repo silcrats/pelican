@@ -37,12 +37,6 @@ services:
     networks: [search]
     depends_on: *after-fixtures
 
-  # Its own name and port, so the test can run next to a real deployment.
-  status:
-    container_name: pelican-itest-status
-    ports: !override
-      - "18090:8090"
-
   crawl-smb:
     environment:
       SHARES_CONFIG: /tests/shares.yaml

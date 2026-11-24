@@ -433,7 +433,7 @@ def run() -> None:
     print(f"Total indexed across all shares: {grand_total}")
     status.job_finished()
     # Non-zero exit so the scheduler and monitoring see the failure; the
-    # status page shows which share and why.
+    # log shows which share and why.
     failed = status.failed_sources()
     if failed:
         sys.exit(f"{len(failed)} share(s) failed: {', '.join(failed)}")

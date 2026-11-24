@@ -109,7 +109,13 @@ def main(root: str) -> None:
     # Excluded by config/shares.yaml's exclude_extensions: must not be indexed.
     with open(os.path.join(root, "Finance", "skip.zip"), "wb") as f:
         f.write(b"PK\x05\x06" + b"\0" * 18)
-    print(f"wrote {len(EXPECTED) + len(OFFICE) + len(EMAILS) + 2} files under {root}/Finance")
+    # A folder only the admin portal test adds as a source (and removes).
+    os.makedirs(os.path.join(root, "Admin"), exist_ok=True)
+    for name in ("added-1.txt", "added-2.txt"):
+        with open(os.path.join(root, "Admin", name), "w") as f:
+            f.write("Pelican admin portal fixture\n")
+        os.chmod(os.path.join(root, "Admin", name), 0o644)
+    print(f"wrote {len(EXPECTED) + len(OFFICE) + len(EMAILS) + 2} files under {root}/Finance, 2 under {root}/Admin")
 
 
 if __name__ == "__main__":

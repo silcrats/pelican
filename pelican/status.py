@@ -1,13 +1,12 @@
 """
 Writes progress to a JSON file on a shared status directory, read by the
-separate always-on status-page service (see status-page/status_server.py).
+admin portal's worker (run_worker.py) for each job's running totals.
 Writes are atomic (write to a temp file, then os.replace) so the reader never
 sees a partially-written file.
 
 status.job_name (JOB_NAME) identifies this crawler instance (e.g.
 "fileserver01", "mail") so multiple crawler containers can each write
-their own file into the same shared status directory without clashing, and
-the status page can show all of them.
+their own file into the same shared status directory without clashing.
 """
 
 import json
@@ -55,7 +54,7 @@ def _write() -> None:
     # simply wins, same as any other last-write-wins file.
     fd, tmp_path = tempfile.mkstemp(dir=status_dir, prefix=os.path.basename(STATUS_PATH) + ".")
     try:
-        # mkstemp creates the file 0600; the status page may run as another
+        # mkstemp creates the file 0600; the reader may run as another
         # user, so keep it world-readable like a plain open() would have.
         os.fchmod(fd, 0o644)
         with os.fdopen(fd, "w") as f:
@@ -72,7 +71,7 @@ def _write() -> None:
 def job_started(share_names: list[str], smb_workers: int = None,
                  exclude_extensions: list[str] = None, exclude_no_extension: bool = None,
                  job_type: str = "smb") -> None:
-    # job_type lets the status page group jobs by crawler kind ("smb", "exchange",
+    # job_type records the crawler kind ("smb", "exchange",
     # "sharepoint", "acl") instead of just sorting job names alphabetically.
     _status["status"] = "running"
     _status["job_type"] = job_type

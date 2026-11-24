@@ -316,7 +316,7 @@ def _extract_pdf(data: bytes, path: str) -> tuple[str, bool]:
 
     Returns (text, timed_out) -- timed_out is tracked separately from
     other extraction failures (corrupt file, decompression limits, etc.)
-    so the status page can report specifically how many files hit the
+    so a crawl can report specifically how many files hit the
     PDF_TIMEOUT_SECONDS wall, since that's the one failure mode that's
     actually tunable (raise the timeout) rather than a broken source file."""
     worker_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_extract_worker.py")
@@ -423,7 +423,7 @@ def extract_text(path: str, data: bytes) -> tuple[str, dict]:
     image_date_taken, each only if present in the file's EXIF),
     and PDFs that time out, which set extraction_timeout. metadata's
     extraction_timeout key is transient -- read by the crawlers to
-    update the status page, never written into the indexed document itself.
+    report progress, never written into the indexed document itself.
     Returns ("", {}) if the type isn't handled (the file still gets indexed
     by filename/metadata, just no body text). `path` should be the full
     SMB-relative path where possible (not just the bare filename), so

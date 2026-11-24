@@ -1,0 +1,202 @@
+<!-- Help page content. app.js loads this into the page (#/help); it is not a page of its own. -->
+<div class="help-page">
+<div class="pagehead"><div class="grow"><h1>Help</h1>
+<div class="muted">How to use the Pelican admin portal.</div></div></div>
+
+<nav class="toc panel" aria-label="Contents">
+  <button class="link" data-target="h-overview">How it works</button>
+  <button class="link" data-target="h-roles">Who can do what</button>
+  <button class="link" data-target="h-add">Adding a source</button>
+  <button class="link" data-target="h-source">Working with a source</button>
+  <button class="link" data-target="h-remove">Disabling or removing a source</button>
+  <button class="link" data-target="h-jobs">Jobs and logs</button>
+  <button class="link" data-target="h-workers">Workers</button>
+  <button class="link" data-target="h-storage">Storage</button>
+  <button class="link" data-target="h-scopes">Scopes</button>
+  <button class="link" data-target="h-credentials">Credentials</button>
+  <button class="link" data-target="h-settings">Settings</button>
+  <button class="link" data-target="h-audit">Audit log</button>
+  <button class="link" data-target="h-trouble">Troubleshooting</button>
+</nav>
+
+<section id="h-overview" class="panel">
+<h2>How it works</h2>
+<p>Pelican crawls file shares, mailboxes and SharePoint sites into one search index, keeping each document's
+permissions, so people only find what they're allowed to see. Each thing it crawls is a <b>source</b>.</p>
+<ul>
+  <li>The portal holds the list of sources, their schedules, and who may manage them.</li>
+  <li><b>Workers</b> do the crawling. They ask the portal for work, run it, and report back. You'll see their
+    progress on a source's page and on <b>Activity</b>.</li>
+  <li>The portal never holds a password. Crawl accounts are kept on the workers; a source only says which one to
+    use.</li>
+  <li>Each crawl only fetches what changed since the last one, so after the first crawl they're quick.</li>
+</ul>
+</section>
+
+<section id="h-roles" class="panel">
+<h2>Who can do what</h2>
+<p>You sign in with your directory (AD) account.</p>
+<ul>
+  <li><b>Super admins</b> can do everything: every source, scopes, credentials, settings, workers and the whole
+    audit log.</li>
+  <li><b>Scoped admins</b> manage the sources in their scopes, within the limits a super admin set on each scope.
+    They don't see other sources.</li>
+</ul>
+<p>Someone who is neither can't sign in. Group changes in AD apply the next time you sign in.</p>
+</section>
+
+<section id="h-add" class="panel">
+<h2>Adding a source</h2>
+<ol>
+  <li>On <b>Sources</b>, choose <b>Add source</b> and pick the type: SMB share, Exchange mailbox or SharePoint
+    site.</li>
+  <li><b>Name</b>: how the source appears in search. Letters, digits, <code>.</code> <code>_</code>
+    <code>-</code>; it must be unique across all types.</li>
+  <li><b>Scope</b>: who besides super admins can manage it.</li>
+  <li>Fill in where it is:
+    <ul>
+      <li>SMB share: the server, the share, and optionally a folder inside it
+        (e.g. <code>Finance\Reports</code>). Pick the <b>crawl account</b> to sign in with.</li>
+      <li>Exchange mailbox: the mailbox address.</li>
+      <li>SharePoint site: the site's full address.</li>
+    </ul></li>
+  <li>Optional settings left at <b>Default</b> use the global settings for that type.</li>
+  <li>For mail and SharePoint, <b>Extra access</b> adds people or groups on top of those who can already see it.
+    In a scope, only the people and groups the scope allows can be added.</li>
+  <li>Choose a <b>schedule</b>, or <i>manual only</i>.</li>
+</ol>
+<p>Then use <b>Test connection</b> before the first crawl. The name and location can't be changed later,
+because every document carries them; to move a source, add a new one and remove the old.</p>
+</section>
+
+<section id="h-source" class="panel">
+<h2>Working with a source</h2>
+<p>Open a source from <b>Sources</b>. Its page shows its settings, how much of the index it takes, and its recent
+jobs.</p>
+<ul>
+  <li><b>Crawl now</b>: crawl it straight away instead of waiting for its schedule.</li>
+  <li><b>Sync permissions</b> (SMB): re-read folder permissions and update who can see each document, without
+    downloading anything.</li>
+  <li><b>Test connection</b>: sign in as the crawler would and read a little. Nothing is indexed.</li>
+  <li><b>Edit</b>: change settings, scope (super admins), or schedule. Changes apply from the next job.</li>
+  <li><b>As the crawler sees it</b> shows the exact settings a worker receives.</li>
+</ul>
+</section>
+
+<section id="h-remove" class="panel">
+<h2>Disabling or removing a source</h2>
+<ul>
+  <li><b>Disable</b> (Edit, untick <i>Crawl this source</i>): no more crawls, but its documents stay searchable.
+    Use this to pause a source.</li>
+  <li><b>Remove source…</b> deletes everything the source indexed and forgets its crawl history. It shows how many
+    documents will go and asks you to type the source's name. A worker then deletes them; the source disappears
+    from the list when that's finished. This can't be undone or cancelled.</li>
+</ul>
+</section>
+
+<section id="h-jobs" class="panel">
+<h2>Jobs and logs</h2>
+<p>Every crawl, permission sync, connection test and removal is a <b>job</b>.</p>
+<ul>
+  <li><b>Queued</b>: waiting for a worker with a free slot. <b>Running</b>: a worker has it.
+    <b>Done</b>, <b>Failed</b> or <b>Cancelled</b> when it ends.</li>
+  <li><b>Result</b> shows running totals while a job runs (updated every 15 seconds), e.g.
+    <i>120 indexed · 4,500 unchanged · 4,620 found</i>, and the final totals when it's done. For a failed job it
+    shows the error.</li>
+  <li><b>Log</b> opens the job's output. It keeps updating while the job runs.</li>
+  <li><b>Cancel</b> stops a queued or running job. Removals can't be cancelled.</li>
+  <li>If a worker stops responding for two minutes, its job is marked failed and runs again at its next scheduled
+    time. A failed removal is tried again after five minutes.</li>
+</ul>
+<p><b>Activity</b> lists jobs for all your sources from the last week.</p>
+</section>
+
+<section id="h-workers" class="panel">
+<h2>Workers <span class="chip">Super admins</span></h2>
+<p>The Workers table on <b>Activity</b> shows each worker, how many jobs it's running, and when it last checked in.
+A worker that hasn't checked in for two minutes is marked <i>not responding</i>; after an hour it leaves the
+list.</p>
+<ul>
+  <li><b>Jobs at once</b>: each worker runs up to the default number of jobs at the same time. Change the default
+    at the top, or give one worker its own number. Workers pick up changes within a few seconds; running jobs are
+    never stopped.</li>
+  <li><b>More workers</b> are added on the server, not in the portal:
+    <code>docker compose … up -d --scale worker=3</code>.</li>
+  <li>Any free worker takes the next job. Connection tests go first, then removals, then crawls oldest first.</li>
+</ul>
+</section>
+
+<section id="h-storage" class="panel">
+<h2>Storage</h2>
+<p>How big the index is and how much of it each source takes. Super admins also see disk space and growth.</p>
+<ul>
+  <li><b>Documents</b> and <b>Raw file size</b> are exact.</li>
+  <li><b>Est. index size</b> is an estimate: OpenSearch reports the size of the whole index, so it's split by each
+    source's share of the stored data.</li>
+  <li><b>Sized</b> below 100% means some documents were indexed before their size was recorded, so the estimate
+    for that source is less certain.</li>
+  <li>Growth and <b>Docs/day</b> need about a day of history.</li>
+  <li>Figures refresh every 15 minutes. Super admins can use <b>Refresh now</b>, once a minute.</li>
+</ul>
+</section>
+
+<section id="h-scopes" class="panel">
+<h2>Scopes</h2>
+<p>A scope hands some sources to a team without making them super admins. Super admins create and edit scopes;
+scoped admins can see the limits of their own.</p>
+<ul>
+  <li><b>Managed by</b>: the AD groups whose members manage the scope.</li>
+  <li><b>Source types</b> the scope can hold.</li>
+  <li><b>SMB servers</b> its shares may be on. The crawl account signs in to these servers, so list only servers
+    you trust.</li>
+  <li><b>Crawl accounts</b> its shares may use.</li>
+  <li><b>May grant users / groups / roles</b>: who its mail and SharePoint sources may give extra access to.
+    <code>guest</code> as a role would make documents visible to everyone.</li>
+  <li><b>Shortest schedule</b>: how often its sources may be crawled at most.</li>
+</ul>
+<p>A scope can only be deleted once its sources are moved or removed.</p>
+</section>
+
+<section id="h-credentials" class="panel">
+<h2>Credentials <span class="chip">Super admins</span></h2>
+<p>A credential profile is a crawl account for SMB shares. It holds only the <i>names</i> of the environment
+variables with the username, password and domain; the values are set on every worker. The <b>default</b> profile is
+<code>default_credentials</code> in the SMB settings.</p>
+<p>A profile can't be renamed, and can't be deleted while a source or scope uses it.</p>
+</section>
+
+<section id="h-settings" class="panel">
+<h2>Settings <span class="chip">Super admins</span></h2>
+<p>The global settings for each source type, as YAML: everything in that type's configuration file except the list
+of sources, for example which file extensions to skip. A source's own settings override these. Crawls started after
+saving use the new settings.</p>
+</section>
+
+<section id="h-audit" class="panel">
+<h2>Audit log</h2>
+<p>Every change in the portal: who made it, when, and what changed (open <i>details</i> for before and after). Super
+admins see everything; scoped admins see changes in their scopes.</p>
+</section>
+
+<section id="h-trouble" class="panel">
+<h2>Troubleshooting</h2>
+<dl class="faq">
+  <dt>A job stays queued</dt>
+  <dd>No worker has a free slot, or no worker is running. Check the Workers table on <b>Activity</b> (super
+    admins), or ask a super admin.</dd>
+  <dt>Test connection fails</dt>
+  <dd>Open its <b>Log</b>. Usually the server or share name is wrong, the crawl account can't read the folder, or
+    the account's variables aren't set on the worker.</dd>
+  <dt>"This scope can't crawl server …"</dt>
+  <dd>The server isn't on the scope's list. A super admin can add it to the scope.</dd>
+  <dt>A crawl failed</dt>
+  <dd>The Result shows the error and the Log has the details. The next crawl carries on from where the last
+    successful one left off.</dd>
+  <dt>A source's documents are still searchable</dt>
+  <dd>Disabling keeps them. Use <b>Remove source…</b> to delete them.</dd>
+  <dt>I can't see a source, or a page</dt>
+  <dd>Scoped admins only see their scopes' sources, and some pages are for super admins only. Group changes apply
+    the next time you sign in.</dd>
+</dl>
+</section>
+</div>

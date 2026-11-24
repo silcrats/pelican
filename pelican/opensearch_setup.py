@@ -14,7 +14,7 @@ the admin key to Pelican's (10001).
 accounts and their roles from environment variables:
 
   OS_PASSWORD          `pelican`: crawlers -- write to the index   (required)
-  OS_STATUS_PASSWORD   `pelican-status`: status page -- read, stats (required)
+  OS_STATUS_PASSWORD   `pelican-status`: admin portal -- read, stats (optional)
   OS_READER_PASSWORD   `pelican-reader`: search UI -- read only    (optional)
   OS_ADMIN_PASSWORD    `admin`: full access, for you               (optional)
 
@@ -169,9 +169,8 @@ def _account(user: str, password: str, role: str, role_body: dict | None) -> Non
 def make_users() -> None:
     passwords = {k: os.environ.get(k, "") for k in
                  ("OS_PASSWORD", "OS_STATUS_PASSWORD", "OS_READER_PASSWORD", "OS_ADMIN_PASSWORD")}
-    missing = [k for k in ("OS_PASSWORD", "OS_STATUS_PASSWORD") if not passwords[k]]
-    if missing:
-        sys.exit(f"[users] missing environment variable(s): {', '.join(missing)}")
+    if not passwords["OS_PASSWORD"]:
+        sys.exit("[users] missing environment variable: OS_PASSWORD")
     index = settings.SEARCH_INDEX
     if settings.VECTOR_ENABLED and not settings.EMBEDDINGS_API_KEY:
         sys.exit("[vector] vector.enabled is on but EMBEDDINGS_API_KEY is not set")
@@ -195,10 +194,13 @@ def make_users() -> None:
                                 "indices:admin/shards/search_shards", "indices:admin/refresh*"],
         }],
     })
-    _account("pelican-status", passwords["OS_STATUS_PASSWORD"], "pelican_status", {
-        "cluster_permissions": ["cluster:monitor/nodes/stats"],
-        "index_permissions": [{"index_patterns": [index], "allowed_actions": ["read", "indices:monitor/stats"]}],
-    })
+    if passwords["OS_STATUS_PASSWORD"]:
+        # The admin portal's storage figures. Named for the status page it replaced,
+        # so existing deployments keep their password.
+        _account("pelican-status", passwords["OS_STATUS_PASSWORD"], "pelican_status", {
+            "cluster_permissions": ["cluster:monitor/nodes/stats"],
+            "index_permissions": [{"index_patterns": [index], "allowed_actions": ["read", "indices:monitor/stats"]}],
+        })
     if passwords["OS_READER_PASSWORD"]:
         _account("pelican-reader", passwords["OS_READER_PASSWORD"], "pelican_reader", {
             "cluster_permissions": reader_vector,

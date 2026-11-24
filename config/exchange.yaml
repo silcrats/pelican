@@ -120,7 +120,7 @@ mailboxes:
 
   # Online Archive: NOT supported yet. Graph's /messages endpoints only serve
   # the primary mailbox; an entry with `archive: true` is reported as failed
-  # on the status page rather than silently indexing the wrong mailbox.
+  # by the crawl rather than silently indexing the wrong mailbox.
   # Archive mail exported as .eml/.msg files to an SMB share covers it meanwhile.
   # - name: jsmith_online_archive
   #   user: jsmith@example.com
