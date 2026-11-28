@@ -15,7 +15,7 @@ from pathlib import Path
 
 from opensearchpy import OpenSearch, helpers
 
-from . import settings
+from . import settings, vectors
 
 SEARCH_INDEX = settings.SEARCH_INDEX
 # OpenSearch refuses any JSON string over 50 million characters, so a huge
@@ -37,48 +37,25 @@ client = OpenSearch(
 )
 
 
-# Vector search (settings.VECTOR_ENABLED): the ingest pipeline splits
-# `content` into CHUNK_FIELD and embeds each passage into VECTOR_FIELD, one
-# nested {"knn": [...]} object per passage. Crawlers never write either.
-CHUNK_FIELD = "content_chunks"
-VECTOR_FIELD = "content_embedding"
-# One vector for the whole document: its passages' average, scaled to length 1.
-# Lets a client compare documents without downloading every passage's vector.
-# Kept in _source only, so it adds nothing to search or to the kNN graphs.
-DOC_VECTOR_FIELD = "content_embedding_mean"
-DOC_VECTOR_MAPPING = {"type": "float", "index": False, "doc_values": False}
-# The pipeline splits a copy of `content` cut to this many characters --
-# room for max_chunks passages of chunk_words words at up to 8 characters a
-# word -- so a huge document can't exceed the analyzer's token limit, which
-# is raised to match (a token is at least one character).
-CHUNK_SOURCE_CHARS = settings.MAX_CHUNKS * settings.CHUNK_WORDS * 8
+# Vector search: the ingest pipeline splits `content` into CHUNK_FIELD and
+# embeds each passage into VECTOR_FIELD, one nested {"knn": [...]} object per
+# passage, plus DOC_VECTOR_FIELD for the whole document. Crawlers never write
+# any of them. See vectors.py.
+CHUNK_FIELD = vectors.CHUNK_FIELD
+VECTOR_FIELD = vectors.VECTOR_FIELD
+DOC_VECTOR_FIELD = vectors.DOC_VECTOR_FIELD
+DOC_VECTOR_MAPPING = vectors.DOC_VECTOR_MAPPING
+CHUNK_SOURCE_CHARS = vectors.chunk_source_chars(settings.MAX_CHUNKS, settings.CHUNK_WORDS)
 
 
 def add_vector_mapping(mapping: dict) -> None:
     """Extend the index body from search_index_mapping.json for vector
-    search: kNN on, the embedding pipeline run on every write (including
-    roles.py's update_by_query, where it reuses existing vectors when the
-    content hasn't changed), and the search pipeline that supplies the model
-    id to neural queries and blends hybrid scores."""
-    mapping.setdefault("settings", {}).update({
-        "index.knn": True,
-        "index.default_pipeline": settings.INGEST_PIPELINE,
-        "index.search.default_pipeline": settings.SEARCH_PIPELINE,
-        "index.analyze.max_token_count": CHUNK_SOURCE_CHARS,
-    })
-    mapping.setdefault("mappings", {}).setdefault("properties", {}).update({
-        # Kept only so the pipeline can tell unchanged passages apart; not searched.
-        CHUNK_FIELD: {"type": "text", "index": False},
-        DOC_VECTOR_FIELD: DOC_VECTOR_MAPPING,
-        VECTOR_FIELD: {
-            "type": "nested",
-            "properties": {"knn": {
-                "type": "knn_vector",
-                "dimension": settings.VECTOR_DIMENSION,
-                "method": {"name": "hnsw", "engine": "faiss", "space_type": "cosinesimil"},
-            }},
-        },
-    })
+    search as config/pelican.yaml sets it up (the pipelines the setup job
+    creates)."""
+    mapping.setdefault("settings", {}).update(vectors.index_settings(
+        settings.INGEST_PIPELINE, settings.SEARCH_PIPELINE, settings.MAX_CHUNKS, settings.CHUNK_WORDS))
+    mapping.setdefault("mappings", {}).setdefault("properties", {}).update(
+        vectors.index_properties(settings.VECTOR_DIMENSION))
 
 
 def add_missing_fields(existing: dict) -> None:
@@ -88,7 +65,7 @@ def add_missing_fields(existing: dict) -> None:
     adds; a field already there is never touched."""
     with open(settings.INDEX_MAPPING_PATH) as f:
         wanted = json.load(f)["mappings"]["properties"]
-    if settings.VECTOR_ENABLED and VECTOR_FIELD in existing:
+    if VECTOR_FIELD in existing:
         wanted = {**wanted, DOC_VECTOR_FIELD: DOC_VECTOR_MAPPING}
     missing = {name: spec for name, spec in wanted.items() if name not in existing}
     if missing:
@@ -102,6 +79,9 @@ def ensure_index_exists() -> None:
     rather than relying on dynamic mapping (which can silently pick a
     different, less predictable type for a field like "share").
 
+    SEARCH_INDEX may be an alias of a numbered index, once it has been
+    rebuilt from the admin portal; everything here works through it.
+
     With multiple crawlers starting close together, a plain check-then-create
     has a real race: two containers can both see "does not exist" and both
     attempt to create it, and the loser would crash on startup. Catch that
@@ -111,13 +91,18 @@ def ensure_index_exists() -> None:
     if already_exists:
         try:
             real_mapping = client.indices.get_mapping(index=SEARCH_INDEX)
-            print(f"[bootstrap] index already exists, current mapping: {json.dumps(real_mapping)}")
-            properties = real_mapping[SEARCH_INDEX]["mappings"].get("properties", {})
+            # Keyed by the real index's name, which differs behind an alias.
+            name, found = next(iter(real_mapping.items()))
+            if name != SEARCH_INDEX:
+                print(f"[bootstrap] '{SEARCH_INDEX}' is an alias of '{name}'")
+            print(f"[bootstrap] index already exists, current mapping: {json.dumps(found)}")
+            properties = found["mappings"].get("properties", {})
             add_missing_fields(properties)
-            has_vectors = VECTOR_FIELD in properties
-            if settings.VECTOR_ENABLED and not has_vectors:
+            built = (found["mappings"].get("_meta") or {}).get("pelican")
+            if settings.VECTOR_ENABLED and VECTOR_FIELD not in properties and not built:
                 print(f"[bootstrap] WARNING: vector.enabled is on but '{SEARCH_INDEX}' was created without "
-                      f"vectors -- new documents won't be embedded until the index is recreated")
+                      f"vectors -- new documents won't be embedded until it's rebuilt with vectors "
+                      f"(admin portal: Index)")
         except Exception as exc:
             print(f"[bootstrap] index exists but reading or updating its mapping failed: {exc}")
         return

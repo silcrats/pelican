@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 COPY pelican ./pelican
 COPY crawl_smb.py crawl_exchange.py crawl_sharepoint.py sync_smb_acl.py \
-     run_worker.py check_source.py purge_source.py ./
+     run_worker.py check_source.py purge_source.py rebuild_index.py ./
 COPY search_index_mapping.json ./
 # Defaults baked in; mount over /app/config (or individual files, or point
 # PELICAN_CONFIG / SHARES_CONFIG / EXCHANGE_CONFIG / SHAREPOINT_CONFIG

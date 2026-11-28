@@ -421,6 +421,107 @@ class StoreTest(unittest.TestCase):
         with self.assertRaises(S.Invalid):
             self.st.cancel_job(self.admin, purge["id"])
 
+    # ------------------------------------------------------ index jobs
+
+    def test_index_jobs_are_super_admin_only(self):
+        for action in S.INDEX_ACTIONS:
+            with self.assertRaises(S.Forbidden):
+                self.st.request_index_job(self.alice, action)
+        with self.assertRaises(S.Forbidden):
+            self.st.save_vector_settings(self.alice, {"enabled": True})
+        with self.assertRaises(S.Invalid):
+            self.st.request_index_job(self.admin, "drop_everything")
+
+    def test_vector_settings_defaults_and_checks(self):
+        st = S.Store(os.path.join(self.tmp.name, "v.db"), ["Pelican Admins"],
+                     vector_defaults={"embeddings_url": "http://tei:8080/embed"})
+        self.addCleanup(st.db.close)
+        admin = st.user("root", ["Pelican Admins"])
+        v = st.vector_settings()
+        self.assertEqual((v["enabled"], v["embeddings_url"], v["chunk_words"]), (False, "http://tei:8080/embed", 300))
+        for bad, why in (({"embeddings_url": "file:///etc/passwd"}, "http"), ({"model": ""}, "model"),
+                         ({"chunk_words": 10}, "passage size"), ({"chunk_overlap": 0.9}, "overlap"),
+                         ({"max_chunks": "lots"}, "number")):
+            with self.assertRaisesRegex(S.Invalid, why):
+                st.save_vector_settings(admin, bad)
+        saved = st.save_vector_settings(admin, {"enabled": True, "model": "BAAI/bge-small-en-v1.5", "chunk_words": "200"})
+        self.assertEqual((saved["enabled"], saved["chunk_words"], saved["embeddings_url"]),
+                         (True, 200, "http://tei:8080/embed"))
+        self.assertEqual(st.vector_settings(), saved)
+        self.assertEqual(st.audit_entries(admin)[0]["action"], "vector settings changed")
+
+    def test_rebuild_job_carries_the_saved_settings(self):
+        job = self.st.request_index_job(self.admin, "rebuild")
+        self.assertIsNone(job["op"]["vectors"])   # vectors off: rebuild without them
+        self.st.cancel_index_job(self.admin, job["id"])
+        self.st.save_vector_settings(self.admin, {"enabled": True, "chunk_words": 250})
+        job = self.st.request_index_job(self.admin, "rebuild")
+        self.assertEqual(job["op"]["vectors"]["chunk_words"], 250)
+        self.assertNotIn("enabled", job["op"]["vectors"])
+        self.assertEqual(job["op"]["requested_by"], "root")
+        with self.assertRaisesRegex(S.Invalid, "another index job"):
+            self.st.request_index_job(self.admin, "check")
+
+    def test_rebuild_waits_for_crawls_and_holds_new_ones(self):
+        a = self.st.save_source(self.admin, self.smb(crawl_minutes=0, acl_minutes=0))
+        b = self.st.save_source(self.admin, self.smb(name="fin-two", crawl_minutes=0, acl_minutes=0))
+        self.st.request_job(self.admin, a["id"], "crawl")
+        t = time.time() + 1
+        crawl = self.st.claim("w1", 0, now=t)
+        self.assertEqual(crawl["type"], "crawl")
+        rebuild = self.st.request_index_job(self.admin, "rebuild")
+        self.assertTrue(self.st.holding())
+        self.st.request_job(self.admin, b["id"], "crawl")
+        self.st.request_job(self.admin, b["id"], "test")
+        t = time.time() + 1
+        # The rebuild waits for the running crawl; the queued crawl waits for the rebuild; tests still run.
+        test = self.st.claim("w1", 1, now=t + 1)
+        self.assertEqual(test["type"], "test")
+        self.assertIsNone(self.st.claim("w1", 0, now=t + 2))
+        self.st.finish("w1", crawl["id"], True, 0, now=t + 3)
+        self.st.finish("w1", test["id"], True, 0, now=t + 3)
+        job = self.st.claim("w2", 0, now=t + 4)
+        self.assertEqual((job["type"], job["id"], job["op"]["action"]), ("index", rebuild["id"], "rebuild"))
+        self.assertIsNone(self.st.claim("w1", 0, now=t + 5))   # still held while it runs
+        self.assertEqual(self.st.index_heartbeat("w2", job["id"], "log", progress="10 of 20 copied", now=t + 6),
+                         {"cancel": False})
+        self.assertEqual(self.st.index_job(job["id"])["summary"], "10 of 20 copied")
+        with self.assertRaises(S.Invalid):
+            self.st.index_finish("w1", job["id"], True)   # not w1's
+        self.st.index_finish("w2", job["id"], True, 0, "log", "done", now=t + 7)
+        self.assertFalse(self.st.holding())
+        self.assertEqual(self.st.claim("w1", 0, now=t + 8)["source"]["name"], "fin-two")
+        self.assertEqual([j["source_id"] for j in self.st.writes_since(t + 7)], [b["id"]])
+        self.assertEqual(self.st.audit_entries(self.admin)[0]["action"], "index rebuild done")
+
+    def test_check_and_drop_dont_hold_crawls(self):
+        a = self.st.save_source(self.admin, self.smb(crawl_minutes=0, acl_minutes=0))
+        self.st.request_job(self.admin, a["id"], "crawl")
+        t = time.time() + 1
+        crawl = self.st.claim("w1", 0, now=t)
+        self.assertEqual(crawl["type"], "crawl")
+        self.st.request_index_job(self.admin, "check")
+        self.assertFalse(self.st.holding())
+        self.assertEqual(self.st.claim("w1", 1, now=t + 1)["op"]["action"], "check")   # doesn't wait
+
+    def test_index_job_cancel_and_lost_lease(self):
+        job = self.st.request_index_job(self.admin, "switch_back")
+        self.assertEqual(self.st.cancel_index_job(self.admin, job["id"])["status"], "cancelled")
+        with self.assertRaises(S.Invalid):
+            self.st.cancel_index_job(self.admin, job["id"])
+        job = self.st.request_index_job(self.admin, "rebuild")
+        t = time.time()
+        self.st.claim("w1", 0, now=t)
+        self.st.cancel_index_job(self.admin, job["id"])
+        self.assertTrue(self.st.index_heartbeat("w1", job["id"], now=t + 1)["cancel"])
+        self.st.index_finish("w1", job["id"], False, 1, now=t + 2)
+        self.assertEqual(self.st.index_job(job["id"])["status"], "cancelled")
+        job = self.st.request_index_job(self.admin, "rebuild")
+        self.st.claim("w1", 0, now=t + 3)
+        self.st.claim("w2", 0, now=t + 3 + S.LEASE_SECONDS + 1)
+        self.assertEqual(self.st.index_job(job["id"])["status"], "failed")
+        self.assertFalse(self.st.holding())
+
     def test_changes_trigger_exports(self):
         before = self.changes
         self.st.save_source(self.admin, self.smb())

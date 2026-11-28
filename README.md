@@ -166,6 +166,26 @@ YAML files and ofelia.
   estimated share of the index, read with the `pelican-status` account and
   refreshed every 15 minutes (`STORAGE_REFRESH_SECONDS`). Growth history is
   kept in `admin-data`. Scoped admins see only their own sources' rows.
+- **Access**: what one person can see in search. Enter a username to see
+  their groups, the roles Frogmouth gives them at sign-in, and for each
+  source how many documents those roles open and through which role. It
+  also flags disabled accounts and groups reached only through another
+  group, which search doesn't count. It needs a directory account to read
+  other people's groups (`LDAP_LOOKUP_USER`, `LDAP_LOOKUP_PASSWORD`; any
+  ordinary domain account will do) and counts with the `pelican-status`
+  account. Scoped admins see only their own sources' rows; each check is
+  in the audit log. If Frogmouth's `security` prefixes or default roles
+  aren't the defaults, set `ROLE_PREFIX_*` and `DEFAULT_ROLES` to match.
+- **Index** (super admins): which index search uses, and its vector
+  search settings: on or off, the embeddings server and model, and the
+  passage size. *Rebuild* builds a new index from the documents already in
+  the live one (nothing is crawled again), embedding each with the saved
+  settings, then switches search to it once it's complete and checked; the
+  previous index is kept so you can switch back until the next crawl
+  writes to the new one. *Check server* tests an embeddings server first.
+  Crawls, ACL syncs and removals wait while a rebuild or switch runs.
+  Needs the `pelican-maintainer` account (`OS_MAINT_PASSWORD` in `.env`,
+  then re-run `opensearch-users`); see [Vector search](#vector-search).
 
 **How it fits together**
 
@@ -313,13 +333,41 @@ model). On first start it waits up to 15 minutes while the service
 downloads the model. Each run replaces the model and its connector with
 fresh ones.
 
+**With the admin portal** you can instead turn vectors on or off, or move
+to another model or passage size, on its *Index* page, on an index that
+already exists. That needs `COMPOSE_PROFILES=vector`, `EMBEDDINGS_API_KEY`
+and `OS_MAINT_PASSWORD` in `.env` (not `VECTOR_ENABLED`), then
+`docker compose ... up -d opensearch-users` to create the
+`pelican-maintainer` account. A rebuild:
+
+1. waits for running crawls, and holds new ones until it's done;
+2. the first time, keeps the index as `documents-1` (a clone, which takes
+   almost no extra space) so that `documents` can become an alias;
+3. registers a model and pipelines of its own (`pelican-embed-<n>`,
+   `pelican-search-<n>`), and creates `documents-<n>` with them;
+4. copies every document into it, re-embedding each (hours on a large
+   index; the progress shows on the page);
+5. checks the copy has every document, then points `documents` at it in one
+   step, so searches never see a half-built index;
+6. keeps the index it replaced as the previous one, and deletes any older
+   one with the model and pipelines only that used.
+
+Search keeps using the old index throughout, so a failed or cancelled
+rebuild changes nothing. The disk needs room for one more copy of the index
+while it runs. To use a different model, run a second embeddings service
+with it (another service like `embeddings` in your compose file, with its own
+`--model-id`), point the portal at its address, and rebuild; once the old
+index is deleted the first service can go. Once the index has been rebuilt
+from the portal, `opensearch-users` leaves its vectors to the portal.
+
 Things to know:
 
-- **New index only.** The index is created with the vector fields and
-  pipelines; an existing index keeps its mapping, and crawlers log a warning
-  if vector search is on but the index has none. To add vectors, delete the
-  index and the crawlers' state volumes, then crawl again. Changing the
-  model or `dimension` needs the same.
+- **New index only, without the portal.** The index is created with the
+  vector fields and pipelines; an existing index keeps its mapping, and
+  crawlers log a warning if vector search is on but the index has none. To
+  add vectors without the portal, delete the index and the crawlers' state
+  volumes, then crawl again. Changing the model or `dimension` needs the
+  same.
 - **Only the start of long documents is embedded:** up to `max_chunks`
   passages (100 by default, about 30,000 words). All of the text stays
   searchable by keyword.
@@ -369,6 +417,7 @@ Changing prefixes or `host` values on an existing index needs a full re-crawl.
 crawl_smb.py, sync_smb_acl.py,     job entry points
 crawl_exchange.py, crawl_sharepoint.py
 check_source.py, purge_source.py   connection test, source removal
+rebuild_index.py                   index rebuilds and switches (portal's Index page)
 run_worker.py                      worker for the admin portal
 pelican/                           shared core
   settings.py                      config loading
@@ -381,6 +430,8 @@ pelican/                           shared core
   status.py, watchdog.py           progress reporting, hang protection
   opensearch_setup.py              certificates, accounts and vector search
                                    setup (compose example)
+  vectors.py                       embedding model, pipelines and index
+                                   settings for vector search
 config/                            example configuration
 search_index_mapping.json          index mapping
 requirements.in                    direct dependencies; requirements.txt is

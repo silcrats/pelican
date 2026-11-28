@@ -144,8 +144,11 @@ function showApp() {
   document.getElementById('who-name').textContent =
     state.me.display_name + (state.me.super_admin ? ' · super admin' : '');
   document.getElementById('version').textContent = 'Pelican admin ' + state.me.version;
-  const links = [['#/sources', 'Sources'], ['#/activity', 'Activity'], ['#/storage', 'Storage'], ['#/scopes', 'Scopes']];
-  if (state.me.super_admin) links.push(['#/credentials', 'Credentials'], ['#/settings', 'Settings']);
+  const links = [['#/sources', 'Sources'], ['#/activity', 'Activity'], ['#/storage', 'Storage'], ['#/access', 'Access'], ['#/scopes', 'Scopes']];
+  if (state.me.super_admin) {
+    links.splice(3, 0, ['#/index', 'Index']);
+    links.push(['#/credentials', 'Credentials'], ['#/settings', 'Settings']);
+  }
   links.push(['#/audit', 'Audit log'], ['#/help', 'Help']);
   document.getElementById('nav').replaceChildren(...links.map(([href, text]) => h('a', { href }, text)));
   route();
@@ -188,7 +191,7 @@ function route() {
   const parts = hash.slice(2).split('/');
   const views = {
     sources: viewSources, source: () => viewSource(parseInt(parts[1], 10)), new: () => viewNew(parts[1]),
-    activity: viewActivity, storage: viewStorage, scopes: viewScopes, credentials: viewCredentials, settings: viewSettings, audit: viewAudit, help: viewHelp,
+    activity: viewActivity, storage: viewStorage, index: viewIndex, access: () => viewAccess(decodeURIComponent(parts.slice(1).join('/'))), scopes: viewScopes, credentials: viewCredentials, settings: viewSettings, audit: viewAudit, help: viewHelp,
   };
   (views[parts[0]] || viewSources)().catch(e => setMain(h('p', { class: 'error' }, e.message)));
   document.getElementById('main').focus({ preventScroll: true });
@@ -838,6 +841,331 @@ async function viewStorage() {
 
   await load();
   state.timer = setInterval(() => { if (!document.hidden) load().catch(() => {}); }, 30000);
+}
+
+// ------------------------------------------------------------------ access
+
+// ------------------------------------------------------------------- index
+
+const INDEX_ACTIONS = { check: 'Check server', rebuild: 'Rebuild', switch_back: 'Switch back', drop_previous: 'Delete previous', tidy: 'Tidy up' };
+const VECTOR_KEYS = ['embeddings_url', 'model', 'chunk_words', 'chunk_overlap', 'max_chunks'];
+
+function vectorText(i) {
+  if (!i.vectors) return 'No vectors (keyword search only)';
+  const m = i.meta || {};
+  if (!m.model) return `Vectors (${i.dimension} dimensions), set up from .env`;
+  return `${m.model}, ${m.dimension} dimensions · passages of ${m.chunk_words} words, ` +
+    `${Math.round(m.chunk_overlap * 100)}% overlap, up to ${m.max_chunks} per document`;
+}
+
+// What a rebuild with these settings would change, compared with the live index.
+function rebuildChanges(settings, live) {
+  if (!live) return [];
+  const m = live.meta || {};
+  if (!settings.enabled) return live.vectors ? ['Turns vector search off: the new index has no vectors, so it\'s smaller.'] : ['Copies the index as it is, without vectors.'];
+  if (!live.vectors) return ['Turns vector search on: every document is embedded.'];
+  const out = [];
+  if (!m.model) out.push('Moves the vector settings from .env to this portal.');
+  if (m.model && m.model !== settings.model) out.push(`New model: ${m.model} → ${settings.model}.`);
+  if (m.embeddings_url && m.embeddings_url !== settings.embeddings_url) out.push(`New embeddings server: ${settings.embeddings_url}.`);
+  if (m.chunk_words && m.chunk_words !== settings.chunk_words) out.push(`Passage size ${m.chunk_words} → ${settings.chunk_words} words.`);
+  if (m.chunk_overlap !== undefined && m.chunk_overlap !== settings.chunk_overlap) out.push(`Overlap ${Math.round(m.chunk_overlap * 100)}% → ${Math.round(settings.chunk_overlap * 100)}%.`);
+  if (m.max_chunks && m.max_chunks !== settings.max_chunks) out.push(`Passages per document ${m.max_chunks} → ${settings.max_chunks}.`);
+  if (!out.length) out.push('Same settings as the live index: every document is embedded again.');
+  return out;
+}
+
+async function viewIndex() {
+  const body = h('div');
+  setMain(h('div', { class: 'pagehead' }, h('div', { class: 'grow' }, h('h1', {}, 'Index'),
+    h('div', { class: 'muted' }, 'Which index search uses, and how its vectors are made.'))), body);
+  const openLogs = new Set();
+  let form = null;   // kept across refreshes so typing isn't lost
+  let confirming = null;
+
+  async function run(action, done) {
+    try {
+      await api('POST', '/api/index/jobs', { action });
+      toast(`${INDEX_ACTIONS[action]} queued.`);
+      confirming = null;
+      if (done) done();
+      await load(true);
+    } catch (e) { toast(e.message, true); }
+  }
+
+  function settingsPanel(d) {
+    if (form && body.contains(form.panel)) return form.panel;
+    const v = d.settings;
+    const enabled = h('input', { type: 'checkbox', name: 'enabled', checked: v.enabled });
+    const url = h('input', { name: 'embeddings_url', value: v.embeddings_url, autocomplete: 'off' });
+    const model = h('input', { name: 'model', value: v.model, autocomplete: 'off' });
+    const words = h('input', { name: 'chunk_words', type: 'number', min: 50, max: 2000, value: v.chunk_words });
+    const overlap = h('input', { name: 'chunk_overlap', type: 'number', min: 0, max: 50, value: Math.round(v.chunk_overlap * 100) });
+    const chunks = h('input', { name: 'max_chunks', type: 'number', min: 1, max: 1000, value: v.max_chunks });
+    const err = h('p', { class: 'error', role: 'alert', hidden: true });
+    const fields = h('div', { class: 'grid' },
+      h('label', { class: 'wide' }, 'Embeddings server', url,
+        h('div', { class: 'help' }, 'A Text Embeddings Inference server\'s /embed address, as OpenSearch reaches it. Its API key is EMBEDDINGS_API_KEY on the workers.')),
+      h('label', {}, 'Model', model, h('div', { class: 'help' }, 'The model that server runs, for the record. The server decides which model is used.')),
+      h('label', {}, 'Passage size (words)', words, h('div', { class: 'help' }, 'About 380 words fit a 512-token model.')),
+      h('label', {}, 'Overlap (%)', overlap, h('div', { class: 'help' }, 'How much neighbouring passages share.')),
+      h('label', {}, 'Passages per document', chunks, h('div', { class: 'help' }, 'Text after that stays keyword-searchable.')));
+    const sync = () => { fields.hidden = !enabled.checked; };
+    enabled.addEventListener('change', sync);
+    sync();
+    const read = () => ({
+      enabled: enabled.checked, embeddings_url: url.value.trim(), model: model.value.trim(),
+      chunk_words: parseInt(words.value, 10), chunk_overlap: (parseFloat(overlap.value) || 0) / 100,
+      max_chunks: parseInt(chunks.value, 10),
+    });
+    async function save(quiet) {
+      err.hidden = true;
+      try {
+        await api('PUT', '/api/index/settings', read());
+        if (!quiet) toast('Saved. A rebuild applies them.');
+        form = null;
+        return true;
+      } catch (e) { err.textContent = e.message; err.hidden = false; return false; }
+    }
+    const panel = h('div', { class: 'panel' }, h('h2', {}, 'Vector settings'),
+      h('label', { class: 'check' }, enabled, 'Vector search (semantic and hybrid search modes)'),
+      fields, err,
+      h('div', { class: 'formactions' },
+        h('button', { class: 'primary', onclick: async () => { if (await save()) load(true); } }, 'Save'),
+        h('button', { onclick: async () => { if (await save(true)) run('check'); } }, 'Check server'),
+        h('span', { class: 'muted' }, 'Saving changes nothing in the index until you rebuild it.')));
+    form = { panel, save };
+    return panel;
+  }
+
+  function indexPanel(i, title, extra) {
+    return h('div', { class: 'panel' }, h('h2', {}, title),
+      h('p', {}, h('b', {}, i.name), ' · ', i.docs === null || i.docs === undefined ? '' : `${i.docs.toLocaleString()} documents · `,
+        fmtBytes(i.bytes)),
+      h('p', {}, vectorText(i)),
+      i.meta && i.meta.built_at ? h('p', { class: 'muted' }, `Built ${new Date(i.meta.built_at).toLocaleString()}`,
+        i.meta.built_by ? ` by ${i.meta.built_by}` : '', i.meta.built_from ? ` from ${i.meta.built_from}` : '') : null,
+      extra);
+  }
+
+  function rebuildPanel(d, live, previous) {
+    const changes = rebuildChanges(d.settings, live);
+    const embed = d.settings.enabled;
+    const start = h('button', { class: 'primary', disabled: !live || d.busy, onclick: () => { confirming = 'rebuild'; draw(d); } }, 'Rebuild…');
+    const confirm = confirming === 'rebuild' ? h('div', { class: 'note' },
+      h('p', {}, h('b', {}, 'While it runs, crawls, ACL syncs and removals wait. '),
+        'Search keeps using the current index until the new one is complete and checked, then switches to it.'),
+      previous ? h('p', {}, `The older previous index, ${previous.name}, is deleted once the new index is live.`) : null,
+      h('div', { class: 'formactions' },
+        h('button', { class: 'primary', onclick: async () => {
+          // Rebuild with what's in the form, not just what was last saved.
+          if (form && !(await form.save(true))) return;
+          run('rebuild');
+        } }, 'Start rebuild'),
+        h('button', { onclick: () => { confirming = null; draw(d); } }, 'Cancel'))) : null;
+    return h('div', { class: 'panel' }, h('h2', {}, 'Rebuild'),
+      h('p', {}, 'Builds a new index from the documents already in the live one, with the saved vector settings. Nothing is crawled again.'),
+      live ? h('ul', {}, changes.map(c => h('li', {}, c))) : h('p', { class: 'warn' }, 'There\'s no index yet: crawl a source first.'),
+      live ? h('p', { class: 'muted' }, `${(live.docs || 0).toLocaleString()} documents to copy` +
+        (embed ? ', each embedded on the way: expect it to take hours on a large index.' : '.') +
+        ` Needs about ${fmtBytes(live.bytes)} of free disk while it runs.`) : null,
+      d.busy ? h('p', { class: 'muted' }, 'Another index job is queued or running.') : null,
+      confirm || h('div', { class: 'formactions' }, start));
+  }
+
+  function previousPanel(d, previous) {
+    const confirmDrop = confirming === 'drop' ? h('div', { class: 'note' },
+      h('p', {}, `Deletes ${previous.name} and the model and pipelines only it used. You can't switch back afterwards.`),
+      h('div', { class: 'formactions' },
+        h('button', { class: 'danger solid', onclick: () => run('drop_previous') }, 'Delete it'),
+        h('button', { onclick: () => { confirming = null; draw(d); } }, 'Cancel'))) : null;
+    const confirmBack = confirming === 'back' ? h('div', { class: 'note' },
+      h('p', {}, `Search switches to ${previous.name}. The current index is kept as the previous one, so you can switch again.`),
+      h('div', { class: 'formactions' },
+        h('button', { class: 'primary', onclick: () => run('switch_back') }, 'Switch back'),
+        h('button', { onclick: () => { confirming = null; draw(d); } }, 'Cancel'))) : null;
+    return indexPanel(previous, 'Previous index', [
+      d.switch_back ? null : h('p', { class: 'muted' }, d.switch_back_why),
+      confirmDrop || confirmBack || h('div', { class: 'formactions' },
+        h('button', { disabled: !d.switch_back || d.busy, onclick: () => { confirming = 'back'; draw(d); } }, 'Switch back…'),
+        h('button', { class: 'danger', disabled: d.busy, onclick: () => { confirming = 'drop'; draw(d); } }, 'Delete previous index…')),
+    ]);
+  }
+
+  function jobsPanel(d) {
+    const rows = d.jobs.map(j => {
+      const live = j.status === 'running' || j.status === 'queued';
+      const took = j.started_at && j.finished_at ? span(j.finished_at - j.started_at)
+        : (j.started_at ? span(d.now - j.started_at) + ' so far' : '');
+      const pre = h('pre', {}, '');
+      const logRow = h('tr', { hidden: !openLogs.has(j.id) }, h('td', { colspan: 6 }, pre));
+      const loadLog = async () => {
+        const full = await api('GET', `/api/index/jobs/${j.id}`);
+        pre.textContent = full.log || (live ? '(no output yet)' : '(no output)');
+        pre.scrollTop = pre.scrollHeight;
+      };
+      if (openLogs.has(j.id)) loadLog().catch(() => {});
+      const toggle = h('button', { class: 'small', onclick: () => {
+        if (openLogs.has(j.id)) openLogs.delete(j.id); else openLogs.add(j.id);
+        logRow.hidden = !openLogs.has(j.id);
+        toggle.textContent = openLogs.has(j.id) ? 'Hide log' : 'Log';
+        if (openLogs.has(j.id)) { pre.textContent = 'Loading…'; loadLog().catch(e => toast(e.message, true)); }
+      } }, openLogs.has(j.id) ? 'Hide log' : 'Log');
+      return [h('tr', {},
+        h('td', {}, INDEX_ACTIONS[j.action] || j.action),
+        h('td', {}, statusChip(j.status), j.cancel && j.status === 'running' ? h('span', { class: 'muted' }, ' stopping') : null),
+        h('td', {}, j.requested_by, ' ', h('span', { class: 'muted' }, timeEl(j.created_at))),
+        h('td', {}, took, j.worker ? h('div', { class: 'muted' }, j.worker) : null),
+        h('td', { class: live ? 'run' : null }, j.summary || (j.status === 'running' ? 'starting…' : (j.status === 'queued' && j.action !== 'check' && j.action !== 'drop_previous' ? 'waits for running crawls to finish' : ''))),
+        h('td', { class: 'actions' }, toggle, live ? h('button', { class: 'small', onclick: async () => {
+          try { await api('POST', `/api/index/jobs/${j.id}/cancel`); toast('Cancelling.'); load(true); }
+          catch (e) { toast(e.message, true); }
+        } }, 'Cancel') : null)), logRow];
+    });
+    return h('div', {}, h('h2', {}, 'Index jobs'), h('div', { class: 'tablewrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['Job', 'Status', 'Requested', 'Took', 'Result', ''].map(t => h('th', {}, t)))),
+      h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: 6, class: 'empty' }, 'No index jobs yet.'))))));
+  }
+
+  function draw(d) {
+    const parts = [];
+    if (d.holding) parts.push(h('div', { class: 'panel note' }, h('b', {}, 'A rebuild or switch is under way. '),
+      d.held ? `${d.held} crawl${d.held === 1 ? '' : 's'}, ACL sync${d.held === 1 ? '' : 's'} or removal${d.held === 1 ? '' : 's'} wait${d.held === 1 ? 's' : ''} until it finishes.`
+        : 'New crawls, ACL syncs and removals wait until it finishes.'));
+    if (d.state_error) parts.push(h('div', { class: 'panel' }, h('p', { class: 'warn' }, d.state_error)));
+    if (d.state && (d.state.leftovers.length || d.state.blocked)) {
+      parts.push(h('div', { class: 'panel danger' }, h('h2', {}, 'A rebuild didn\'t finish'),
+        d.state.blocked ? h('p', { class: 'warn' }, `Writes to ${d.state.alias} are blocked, so crawls fail until this is tidied up.`) : null,
+        d.state.leftovers.length ? h('p', {}, `Left behind: ${d.state.leftovers.join(', ')}. Search doesn't use ${d.state.leftovers.length === 1 ? 'it' : 'them'}.`) : null,
+        h('div', { class: 'formactions' }, h('button', { class: 'primary', disabled: d.busy, onclick: () => run('tidy') }, 'Tidy up'),
+          h('span', { class: 'muted' }, 'Deletes what the unfinished rebuild made; a new rebuild also does this first.'))));
+    }
+    const st = d.state;
+    const live = st ? st.indexes.find(i => i.live) : null;
+    const previous = st && d.previous ? st.indexes.find(i => i.name === d.previous) : null;
+    if (st) {
+      const note = st.plain ? h('p', { class: 'muted' }, `${st.alias} is a plain index. The first rebuild keeps it as ${st.alias}-1 and makes ${st.alias} point to the new one.`)
+        : live ? h('p', { class: 'muted' }, `Search uses ${st.alias}, which points to ${live.name}.`) : null;
+      const counted = live && live.vectors && st.with_vectors !== null
+        ? h('p', {}, `${st.with_vectors.toLocaleString()} of ${(live.docs || 0).toLocaleString()} documents have vectors; the rest have no text to embed.`) : null;
+      parts.push(live ? indexPanel(live, 'In use', [counted, note]) : h('div', { class: 'panel empty' }, `There's no ${st.alias} index yet.`));
+      if (previous) parts.push(previousPanel(d, previous));
+    }
+    parts.push(settingsPanel(d));
+    if (st) parts.push(rebuildPanel(d, live, previous));
+    parts.push(jobsPanel(d));
+    body.replaceChildren(...parts);
+  }
+
+  async function load(force) {
+    const d = await api('GET', '/api/index');
+    d.busy = d.jobs.some(j => j.status === 'queued' || j.status === 'running');
+    if (force) form = null;
+    // Not while someone is typing in the settings: a redraw would lose it.
+    if (!force && form && form.panel.contains(document.activeElement)) return;
+    draw(d);
+  }
+  await load(true);
+  state.timer = setInterval(() => { if (!document.hidden) load().catch(() => {}); }, 10000);
+}
+
+const ROLE_FROM = { default: 'Everyone signed in', user: 'The account itself', group: 'Group' };
+
+async function viewAccess(username) {
+  const avail = await api('GET', '/api/access');
+  const input = h('input', { type: 'search', name: 'user', value: username || '', placeholder: 'Username, e.g. alice',
+    'aria-label': 'Username', autocomplete: 'off', spellcheck: 'false' });
+  const form = h('form', { class: 'toolbar', onsubmit: (ev) => {
+    ev.preventDefault();
+    const name = input.value.trim();
+    if (!name) return;
+    const target = '#/access/' + encodeURIComponent(name);
+    if (location.hash === target) route(); else location.hash = target;
+  } }, input, h('button', { type: 'submit', class: 'primary' }, 'Check'));
+  const body = h('div');
+  setMain(h('div', { class: 'pagehead' }, h('div', { class: 'grow' }, h('h1', {}, 'Access'),
+    h('div', { class: 'muted' }, 'What one person can see in search: their groups, the roles Frogmouth gives them, ' +
+      (state.me.super_admin ? 'and how many documents each source shows them.' : 'and how many documents each of your sources shows them.')))),
+  avail.lookup ? form : null, body);
+
+  if (!avail.lookup) {
+    body.replaceChildren(h('div', { class: 'panel empty' },
+      'The access check needs a directory account to read other people\'s groups: set LDAP_LOOKUP_USER and ',
+      'LDAP_LOOKUP_PASSWORD for the portal (any ordinary domain account will do). See Help.'));
+    return;
+  }
+  if (!username) {
+    body.replaceChildren(h('p', { class: 'help' }, 'Enter a username to see what that person can find.'));
+    input.focus();
+    return;
+  }
+  body.replaceChildren(h('p', { class: 'muted' }, 'Checking…'));
+  let d;
+  try {
+    d = await api('GET', '/api/access?user=' + encodeURIComponent(username));
+  } catch (e) {
+    body.replaceChildren(h('p', { class: 'error' }, e.message));
+    return;
+  }
+  if (!d.found) {
+    body.replaceChildren(h('div', { class: 'panel empty' }, `There's no account named "${d.username}" in the directory.`));
+    return;
+  }
+  const parts = [];
+  parts.push(h('div', { class: 'panel' },
+    h('h2', {}, d.display_name, d.display_name !== d.username ? h('span', { class: 'muted' }, ` (${d.username})`) : null),
+    d.disabled ? h('p', { class: 'warn' }, 'This account is disabled, so it can\'t sign in to search at all. ' +
+      'The figures below are what it would see if it could.') : null,
+    h('dl', { class: 'facts' },
+      h('dt', {}, 'Groups'), h('dd', {}, d.groups.length
+        ? d.groups.slice().sort((a, b) => a.localeCompare(b)).map(g => [h('span', { class: 'chip' }, g), ' '])
+        : h('span', { class: 'muted' }, 'none')),
+      d.nested_groups && d.nested_groups.length ? [h('dt', {}, 'Not counted'), h('dd', {},
+        d.nested_groups.map(g => [h('span', { class: 'chip warn' }, g), ' ']),
+        h('div', { class: 'muted small' }, 'Groups this account is in only through another group. ' +
+          'Search counts direct memberships only, so documents shared with these groups stay hidden from it.'))] : null)));
+
+  parts.push(h('h2', {}, 'Roles'));
+  parts.push(h('div', { class: 'tablewrap' }, h('table', {},
+    h('thead', {}, h('tr', {}, h('th', {}, 'Role'), h('th', {}, 'Comes from'))),
+    h('tbody', {}, d.roles.map(r => h('tr', {}, h('td', {}, h('code', {}, r.role)),
+      h('td', {}, ROLE_FROM[r.from] || r.from, r.from === 'group' ? `: ${r.name}` : '')))))));
+
+  parts.push(h('h2', {}, 'What they can see'));
+  if (!d.counts) {
+    parts.push(h('div', { class: 'panel empty' }, 'Document counts aren\'t set up: the portal needs OS_HOST and a read-only OpenSearch account.'));
+  } else if (d.counts_error) {
+    parts.push(h('p', { class: 'error' }, d.counts_error));
+  } else {
+    let visible = 0, total = 0;
+    const rows = d.sources.map(r => {
+      visible += r.visible; total += r.total;
+      const through = Object.entries(r.by_role).sort((a, b) => b[1] - a[1]);
+      return h('tr', { class: r.visible ? null : 'muted' },
+        h('td', {}, h('a', { href: `#/source/${r.source_id}` }, r.name), ' ', h('span', { class: 'kind' }, KIND_SHORT[r.kind] || r.kind)),
+        h('td', { class: 'num' }, h('b', {}, r.visible.toLocaleString())),
+        h('td', { class: 'num' }, r.total.toLocaleString()),
+        h('td', { class: 'num' }, r.total ? (100 * r.visible / r.total).toFixed(r.visible && r.visible < r.total ? 1 : 0) + '%' : '–'),
+        h('td', {}, through.length ? through.map(([role, n]) => [h('code', {}, role), h('span', { class: 'muted' }, ` ${n.toLocaleString()}`), ' '])
+          : h('span', { class: 'muted' }, r.total ? 'nothing' : 'no documents yet')));
+    });
+    parts.push(h('div', { class: 'tablewrap' }, h('table', { class: 'numbers' },
+      h('thead', {}, h('tr', {}, ['Source', 'Can see', 'Documents', 'Share', 'Through'].map((t, i) =>
+        h('th', { class: i && i < 4 ? 'num' : null }, t)))),
+      h('tbody', {}, rows.length ? rows : h('tr', {}, h('td', { colspan: 5, class: 'empty' }, 'No sources to show.'))),
+      rows.length > 1 ? h('tfoot', {}, h('tr', {}, h('th', {}, 'All of these'),
+        h('th', { class: 'num' }, visible.toLocaleString()), h('th', { class: 'num' }, total.toLocaleString()),
+        h('th', { class: 'num' }, total ? (100 * visible / total).toFixed(1) + '%' : '–'), h('th', {}))) : null)));
+    if (d.outside) {
+      parts.push(h('p', { class: 'muted' }, `Also ${d.outside.visible.toLocaleString()} of ${d.outside.total.toLocaleString()} ` +
+        `documents from ${d.outside.sources} source${d.outside.sources === 1 ? '' : 's'} the portal doesn't manage.`));
+    }
+    parts.push(h('p', { class: 'help' },
+      'Counted from the index just now. A document can be open to several of the person\'s roles, so the Through ',
+      'figures can add up to more than Can see. A folder\'s permissions reach the index at the source\'s next ACL sync, ',
+      'and a change to someone\'s groups takes effect in search the next time they sign in.'));
+  }
+  body.replaceChildren(...parts);
 }
 
 // ------------------------------------------------------------------ scopes

@@ -12,6 +12,8 @@
   <button class="link" data-target="h-jobs">Jobs and logs</button>
   <button class="link" data-target="h-workers">Workers</button>
   <button class="link" data-target="h-storage">Storage</button>
+  <button class="link" data-target="h-access">Access</button>
+  <button class="link" data-target="h-index">Index</button>
   <button class="link" data-target="h-scopes">Scopes</button>
   <button class="link" data-target="h-credentials">Credentials</button>
   <button class="link" data-target="h-settings">Settings</button>
@@ -138,6 +140,54 @@ list.</p>
   <li>Growth and <b>Docs/day</b> need about a day of history.</li>
   <li>Figures refresh every 15 minutes. Super admins can use <b>Refresh now</b>, once a minute.</li>
 </ul>
+</section>
+
+<section id="h-access" class="panel">
+<h2>Access</h2>
+<p>What one person can see in search. Enter a username and the page shows:</p>
+<ul>
+  <li><b>Groups</b>: the groups search counts for them, which are their direct memberships plus their primary group
+    (usually Domain Users).</li>
+  <li><b>Not counted</b>: groups they're in only through another group. Search doesn't count these, so a folder
+    shared only with such a group stays hidden from them. Add them to the group directly, or share the folder with
+    the group they're directly in.</li>
+  <li><b>Roles</b>: exactly what Frogmouth gives them when they sign in. A document shows up for them if its
+    permissions carry any one of these.</li>
+  <li><b>What they can see</b>: per source, how many documents they can find out of how many there are, and
+    <b>Through</b> which role. Scoped admins see only their own sources.</li>
+</ul>
+<p>Counts come from the index when you check. A change to a folder's permissions reaches the index at the source's
+next ACL sync, and a change to someone's groups takes effect the next time they sign in to search. A disabled account
+is flagged: it can't sign in at all. Every check is recorded in the audit log.</p>
+<p>The page needs a directory account to read other people's groups (<code>LDAP_LOOKUP_USER</code> and
+<code>LDAP_LOOKUP_PASSWORD</code>). Without one it says so.</p>
+</section>
+
+<section id="h-index" class="panel">
+<h2>Index <span class="chip">Super admins</span></h2>
+<p>Which index search uses, and whether and how its documents have vectors for semantic and hybrid search.</p>
+<ul>
+  <li><b>In use</b>: the live index, how many documents it has, and how its vectors were made.</li>
+  <li><b>Vector settings</b>: what the next rebuild uses. The embeddings server is a Text Embeddings Inference
+    service's <code>/embed</code> address; the model it runs is set where that service is started, so name it here
+    for the record. Saving changes nothing until you rebuild.</li>
+  <li><b>Check server</b> asks the server for a test embedding through OpenSearch, and says how many dimensions
+    its vectors have.</li>
+  <li><b>Rebuild</b> makes a new index from the documents in the live one, embedding each with the saved settings,
+    or without vectors if vector search is off. Nothing is crawled again. Search keeps using the live index until the
+    new one is complete and has every document, then switches to it. With vectors it can take hours.</li>
+  <li>While a rebuild or switch runs, crawls, ACL syncs and removals wait; connection tests still run. It starts once
+    running crawls have finished.</li>
+  <li><b>Previous index</b>: the one search used before. <b>Switch back</b> is possible until a crawl, ACL sync or
+    removal writes to the live index; after that the previous index lacks those changes. A rebuild deletes the
+    previous index once the new one is live; <b>Delete previous index</b> does it now, with the model and pipelines
+    only it used.</li>
+  <li>Cancelling a rebuild deletes what it had made; search is unchanged.</li>
+</ul>
+<p>To move to another model, start a second embeddings service with it, put its address here, check it, and rebuild.
+Frogmouth (with <code>vector.enabled: auto</code>, the default) offers semantic and hybrid search whenever the live
+index has vectors. Index jobs need the <code>pelican-maintainer</code> account on the workers
+(<code>OS_MAINT_PASSWORD</code>).</p>
 </section>
 
 <section id="h-scopes" class="panel">

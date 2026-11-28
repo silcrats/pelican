@@ -9,7 +9,7 @@
 # - admin: the portal. Signs people in against AD and holds no source
 #   credentials: it only says what to crawl.
 # - worker: runs the jobs the portal hands out (crawls, ACL syncs, tests,
-#   removals) with the credentials in .env. How many jobs each runs at once
+#   removals, index rebuilds) with the credentials in .env. How many jobs each runs at once
 #   is set in the portal (Activity page); add workers with `--scale worker=3`.
 # - The per-job crawler containers move to the "yaml-jobs" profile (not
 #   started) and ofelia keeps only the mailbox permission export, which
@@ -36,6 +36,16 @@ services:
       # A private CA for ldaps:// or StartTLS: mount it, e.g. ./secrets/ldap-ca.pem:/run/secrets/ldap-ca.pem:ro
       LDAP_CA_FILE: ${LDAP_CA_FILE:-}
       SUPER_ADMIN_GROUPS: ${SUPER_ADMIN_GROUPS:-}
+      # Optional: a directory account for the Access page to read other
+      # people's groups. Read-only; any ordinary domain account will do.
+      LDAP_LOOKUP_USER: ${LDAP_LOOKUP_USER:-}
+      LDAP_LOOKUP_PASSWORD: ${LDAP_LOOKUP_PASSWORD:-}
+      # How the Access page builds a person's roles. Must match Frogmouth's
+      # security block and roles: in config/pelican.yaml (these are their defaults).
+      ROLE_PREFIX_USER: ${ROLE_PREFIX_USER:-1}
+      ROLE_PREFIX_GROUP: ${ROLE_PREFIX_GROUP:-2}
+      ROLE_PREFIX_ROLE: ${ROLE_PREFIX_ROLE:-R}
+      DEFAULT_ROLES: ${DEFAULT_ROLES:-guest}
       ADMIN_BREAKGLASS_PASSWORD: ${ADMIN_BREAKGLASS_PASSWORD:-}
       ADMIN_SECURE_COOKIE: ${ADMIN_SECURE_COOKIE:-false}
       # Schedule for imported and new sources, in minutes; 0 = manual only.
@@ -46,12 +56,22 @@ services:
       OS_USERNAME: pelican-status
       OS_PASSWORD: ${OS_STATUS_PASSWORD:?set OS_STATUS_PASSWORD in .env}
       OS_CA_CERTS: /certs/ca.pem
+      # The Index page's suggested embeddings server and model (config/pelican.yaml's defaults).
+      EMBEDDINGS_URL: ${EMBEDDINGS_URL:-http://embeddings/embed}
+      EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-BAAI/bge-base-en-v1.5}
       TZ: ${TZ:-UTC}
     volumes:
       - admin-data:/data
       - admin-export:/export
       - ./config:/import:ro
-      - certs:/certs:ro
+      # Only the CA certificate: the certs volume also holds the OpenSearch
+      # admin key, which nothing here should have.
+      - type: volume
+        source: certs
+        target: /certs/ca.pem
+        read_only: true
+        volume:
+          subpath: ca.pem
     ports:
       - "8091:8091"
     networks: [search]
@@ -67,6 +87,9 @@ services:
       OS_USERNAME: pelican
       OS_CA_CERTS: /certs/ca.pem
       ADMIN_URL: http://admin:8091
+      # Index jobs from the portal's Index page sign in as this account, with
+      # OS_MAINT_PASSWORD from .env; without it they fail and nothing changes.
+      OS_MAINT_USERNAME: pelican-maintainer
     volumes:
       # The same state volumes the one-shot crawlers used, so nothing is
       # crawled again from scratch.
@@ -75,7 +98,14 @@ services:
       - state-sharepoint:/state/sharepoint
       - status:/status
       - exo-permissions:/perm:ro
-      - certs:/certs:ro
+      # Only the CA certificate: the certs volume also holds the OpenSearch
+      # admin key, which nothing here should have.
+      - type: volume
+        source: certs
+        target: /certs/ca.pem
+        read_only: true
+        volume:
+          subpath: ca.pem
     networks: [search]
     depends_on:
       admin:

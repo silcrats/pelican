@@ -39,12 +39,36 @@ DIRECTORY = {
 }
 
 
+# Accounts the Access page can look up: groups as Frogmouth counts them,
+# nested-only groups, disabled flag.
+LOOKUP = {
+    "erin": (["Finance", "Domain Users"], ["All Staff"], False),
+    "olduser": (["Domain Users"], [], True),
+}
+
+
 class FakeLdap:
+    lookup_ok = True
+
     def authenticate(self, username, password):
         entry = DIRECTORY.get(username)
         if not entry or entry[0] != password:
             raise SignInFailed("invalid credentials")
         return username, entry[1], username.title()
+
+    def can_look_up(self):
+        return True
+
+    def lookup(self, username):
+        from ldap_auth import LookupFailed
+        if not FakeLdap.lookup_ok:
+            raise LookupFailed("directory unavailable: timed out")
+        key = username.lower()
+        if key not in LOOKUP:
+            return None
+        groups, nested, disabled = LOOKUP[key]
+        return {"username": key, "display_name": key.title(), "groups": groups, "nested_groups": nested,
+                "disabled": disabled}
 
     def describe(self):
         return "fake directory"
@@ -251,6 +275,87 @@ class ServerTest(unittest.TestCase):
 
     # ------------------------------------------------------------ static
 
+    def test_access_check(self):
+        root = self.client("root")
+        fin = root.request("POST", "/api/sources", {
+            "kind": "smb", "name": "fin-access", "scope_id": self.scope["id"], "crawl_minutes": 0, "acl_minutes": 0,
+            "config": {"server": "files1.example.local", "share": "data", "path": "Access"}})[1]
+        asked = []
+
+        def fake_search(path, body):
+            asked.append(body)
+            roles = next((f["terms"]["role"] for f in body["query"].get("bool", {}).get("filter", [])), None)
+
+            def bucket(share, host, n, granted=None):
+                hb = {"key": host, "doc_count": n}
+                if granted is not None:
+                    hb["granted"] = {"buckets": [{"key": k, "doc_count": v} for k, v in granted.items()]}
+                return {"key": share, "doc_count": n, "host": {"buckets": [hb]}}
+            if roles is None:
+                buckets = [bucket("fin-access", "smb-share", 10), bucket("hr-secret", "smb-share", 7),
+                           bucket("legacy", "smb-share", 4)]
+            else:
+                buckets = [bucket("fin-access", "smb-share", 6, {"2Finance": 5, "1erin": 2}),
+                           bucket("legacy", "smb-share", 1, {"Rguest": 1})]
+            return {"aggregations": {"by_share": {"buckets": buckets}}}
+
+        app = admin_server.Handler.app
+        app.os_search = fake_search
+        try:
+            self.assertEqual(root.request("GET", "/api/access")[1], {"lookup": True, "counts": True})
+            d = root.request("GET", "/api/access?user=Erin")[1]
+            self.assertTrue(d["found"])
+            self.assertEqual([r["role"] for r in d["roles"]], ["Rguest", "1erin", "2Finance", "2Domain Users"])
+            self.assertEqual(d["nested_groups"], ["All Staff"])
+            by = {r["name"]: r for r in d["sources"]}
+            self.assertEqual((by["fin-access"]["visible"], by["fin-access"]["total"]), (6, 10))
+            self.assertEqual(by["fin-access"]["by_role"], {"2Finance": 5, "1erin": 2})
+            self.assertEqual((by["hr-secret"]["visible"], by["hr-secret"]["total"]), (0, 7))
+            self.assertEqual(d["outside"], {"sources": 1, "total": 4, "visible": 1})
+            self.assertEqual(asked[-1]["query"]["bool"]["filter"][0]["terms"]["role"],
+                             ["Rguest", "1erin", "2Finance", "2Domain Users"])
+
+            # A scoped admin: only their scope's sources, nothing about the rest of the index.
+            alice = self.client("alice")
+            scoped = alice.request("GET", "/api/access?user=erin")[1]
+            self.assertEqual([r["name"] for r in scoped["sources"]], ["fin-access"])
+            self.assertIsNone(scoped["outside"])
+
+            self.assertTrue(root.request("GET", "/api/access?user=olduser")[1]["disabled"])
+            self.assertEqual(root.request("GET", "/api/access?user=nobody")[1]["found"], False)
+            audit = [e for e in root.request("GET", "/api/audit")[1] if e["action"] == "check access"]
+            self.assertEqual([e["target"] for e in audit[:4]], ["nobody", "olduser", "erin", "Erin"])
+
+            FakeLdap.lookup_ok = False
+            status, err, _ = root.request("GET", "/api/access?user=erin")
+            self.assertEqual(status, 400)
+            self.assertIn("directory", err["error"])
+            FakeLdap.lookup_ok = True
+
+            app.os_search = None
+            d = root.request("GET", "/api/access?user=erin")[1]
+            self.assertFalse(d["counts"])
+            self.assertEqual(d["sources"], [])
+            self.assertEqual(Client(self.port).request("GET", "/api/access?user=erin")[0], 401)
+        finally:
+            FakeLdap.lookup_ok = True
+            app.os_search = None
+            root.request("DELETE", f"/api/sources/{fin['id']}", {"confirm": "fin-access"})
+
+    def test_access_check_without_lookup_account(self):
+        app = admin_server.Handler.app
+        saved = app.ldap
+        app.ldap = type("NoLookup", (), {"authenticate": FakeLdap.authenticate, "can_look_up": lambda self: False,
+                                         "describe": lambda self: "x"})()
+        try:
+            root = self.client("root")
+            self.assertEqual(root.request("GET", "/api/access")[1]["lookup"], False)
+            status, err, _ = root.request("GET", "/api/access?user=erin")
+            self.assertEqual(status, 400)
+            self.assertIn("LDAP_LOOKUP_USER", err["error"])
+        finally:
+            app.ldap = saved
+
     def test_static_and_headers(self):
         c = Client(self.port)
         status, body, res = c.request("GET", "/")
@@ -406,6 +511,152 @@ class ServerTest(unittest.TestCase):
         self.assertIn("working", done["log"])
 
 
+    # ------------------------------------------------------------ index
+
+    def clear_index_jobs(self):
+        with self.st.lock:
+            self.st.db.execute("UPDATE index_jobs SET status='cancelled' WHERE status IN ('queued','running')")
+            self.st.db.commit()
+
+    def test_index_page_is_super_admin_only(self):
+        alice = self.client("alice")
+        self.assertEqual(alice.request("GET", "/api/index")[0], 403)
+        self.assertEqual(alice.request("PUT", "/api/index/settings", {"enabled": True})[0], 403)
+        self.assertEqual(alice.request("POST", "/api/index/jobs", {"action": "check"})[0], 403)
+
+    def test_index_page_without_opensearch(self):
+        self.clear_index_jobs()
+        root = self.client("root")
+        status, d, _ = root.request("GET", "/api/index")
+        self.assertEqual(status, 200, d)
+        self.assertIn("OS_HOST", d["state_error"])
+        self.assertEqual(d["settings"]["model"], "BAAI/bge-base-en-v1.5")
+        status, err, _ = root.request("POST", "/api/index/jobs", {"action": "rebuild"})
+        self.assertEqual(status, 400)
+        self.assertIn("OS_HOST", err["error"])
+        status, saved, _ = root.request("PUT", "/api/index/settings", {"enabled": True, "chunk_words": 120})
+        self.assertEqual((status, saved["chunk_words"]), (200, 120))
+        self.assertEqual(root.request("PUT", "/api/index/settings", {"embeddings_url": "ftp://x"})[0], 400)
+        status, job, _ = root.request("POST", "/api/index/jobs", {"action": "check"})   # needs no OpenSearch here
+        self.assertEqual((status, job["op"]["vectors"]["chunk_words"]), (200, 120))
+        self.assertEqual(root.request("POST", f"/api/index/jobs/{job['id']}/cancel")[1]["status"], "cancelled")
+
+    def test_index_state_and_choices(self):
+        def fake(responses):
+            def get(path):
+                for prefix, reply in responses.items():
+                    if path.startswith(prefix):
+                        return reply
+                return None
+            return get
+        vec = {"properties": {"content": {"type": "text"},
+                              "content_embedding": {"type": "nested", "properties": {"knn": {"dimension": 768}}}}}
+        plain = admin_server.index_state(fake({
+            "/documents/_alias": {"documents": {"aliases": {}}},
+            "/documents,documents-*/_mapping": {"documents": {"mappings": vec}},
+            "/documents,documents-*/_stats": {"indices": {"documents": {
+                "total": {"store": {"size_in_bytes": 999}}}}},
+        }), lambda path, body: {"count": 8 if "nested" in json.dumps(body) else 10})
+        self.assertEqual((plain["live"], plain["plain"], plain["with_vectors"]), ("documents", True, 8))
+        self.assertEqual((plain["indexes"][0]["docs"], plain["indexes"][0]["bytes"]), (10, 999))
+        self.assertEqual(plain["indexes"][0]["dimension"], 768)
+        app = admin_server.Handler.app
+        self.assertFalse(app._index_choices(plain)["switch_back"])
+
+        meta = {**vec, "_meta": {"pelican": {"generation": 2, "model": "m"}}}
+        both = admin_server.index_state(fake({
+            "/documents/_alias": {"documents-2": {"aliases": {"documents": {}}}},
+            "/documents,documents-*/_mapping": {"documents-1": {"mappings": vec}, "documents-2": {"mappings": meta}},
+            "/documents,documents-*/_stats": {"indices": {}},
+        }), lambda path, body: {"count": 5})
+        self.assertEqual([(i["name"], i["live"], i["built"]) for i in both["indexes"]],
+                         [("documents-2", True, True), ("documents-1", False, False)])
+        self.assertEqual((both["leftovers"], both["blocked"]), ([], False))
+        unfinished = {**vec, "_meta": {"pelican": {"generation": 3}}}   # never switched to
+        stuck = admin_server.index_state(fake({
+            "/documents/_alias": {"documents": {"aliases": {}}},
+            "/documents/_settings": {"documents": {"settings": {"index": {"blocks": {"write": "true"}}}}},
+            "/documents,documents-*/_mapping": {"documents": {"mappings": vec}, "documents-1": {"mappings": vec},
+                                                "documents-2": {"mappings": unfinished}},
+            "/documents,documents-*/_stats": {"indices": {}},
+        }), lambda path, body: {"count": 1})
+        self.assertEqual((stuck["leftovers"], stuck["blocked"]), (["documents-1", "documents-2"], True))
+        self.assertIsNone(admin_server.Handler.app._index_choices(stuck)["previous"])
+        self.clear_index_jobs()
+        with self.st.lock:
+            self.st.db.execute("DELETE FROM index_jobs")
+            self.st.db.commit()
+        choices = app._index_choices(both)
+        self.assertEqual(choices["previous"], "documents-1")
+        self.assertFalse(choices["switch_back"])   # no switch recorded by this portal
+        root_user = self.st.user("root", ["Pelican Admins"])
+        job = self.st.request_index_job(root_user, "rebuild")
+        self.st.claim("w-index", 0)
+        self.st.index_finish("w-index", job["id"], True, 0)
+        self.assertTrue(app._index_choices(both)["switch_back"])
+        # A crawl after the switch rules switching back out.
+        with self.st.lock:
+            self.st.db.execute("INSERT INTO jobs (source_id, type, status, created_at, started_at) VALUES (?, 'crawl', 'done', ?, ?)",
+                               (self.secret["id"], time.time() + 1, time.time() + 1))
+            self.st.db.commit()
+        choices = app._index_choices(both)
+        self.assertFalse(choices["switch_back"])
+        self.assertIn("1 job", choices["switch_back_why"])
+
+    def test_worker_runs_index_job(self):
+        os.environ["ADMIN_URL"] = f"http://127.0.0.1:{self.port}"
+        os.environ["OS_MAINT_PASSWORD"] = "maint-secret"
+        os.environ["OS_PASSWORD"] = "crawler-secret"
+        self.addCleanup(os.environ.pop, "OS_MAINT_PASSWORD")
+        self.addCleanup(os.environ.pop, "OS_PASSWORD")
+        import importlib
+        import run_worker
+        importlib.reload(run_worker)
+        run_worker.STATUS_DIR = tempfile.mkdtemp(prefix="pelican-status-index-")
+        self.clear_queue()
+        self.clear_index_jobs()
+        root = self.client("root")
+        job = root.request("POST", "/api/index/jobs", {"action": "check"})[1]
+        progress_file = os.path.join(run_worker.STATUS_DIR, "status-index.json")
+        stub = ("import json, os; op = json.loads(os.environ['INDEX_OP']); print('action', op['action']); "
+                f"json.dump({{'progress': 'asking the server'}}, open({progress_file!r}, 'w')); "
+                "print('maint' if os.environ.get('OS_MAINT_PASSWORD') else 'no maint'); "
+                "print('crawler' if os.environ.get('OS_PASSWORD') else 'no crawler'); print('checked')")
+        run_worker.Job.command = lambda self: [sys.executable, "-c", stub]
+        w = run_worker.Worker()
+        self.assertTrue(w._claim())
+        for _ in range(100):
+            w._reap()
+            if not w.jobs:
+                break
+            time.sleep(0.05)
+        w._report()
+        done = root.request("GET", f"/api/index/jobs/{job['id']}")[1]
+        self.assertEqual((done["status"], done["summary"]), ("done", "checked"), done)
+        self.assertIn("action check", done["log"])
+        self.assertIn("maint", done["log"])
+        self.assertIn("no crawler", done["log"])   # index jobs get only the maintainer account
+
+    def test_source_jobs_dont_get_the_maintainer_password(self):
+        os.environ["OS_MAINT_PASSWORD"] = "maint-secret"
+        self.addCleanup(os.environ.pop, "OS_MAINT_PASSWORD")
+        import run_worker
+        job = run_worker.Job({"id": 1, "type": "test", "source": {"kind": "smb", "name": "x"}, "config_yaml": "",
+                              "config_env": "SHARES_CONFIG", "names_env": "SHARE_NAMES"})
+        self.addCleanup(job.cleanup)
+        seen = {}
+        real = run_worker.subprocess.Popen
+        def fake(cmd, env=None, **kw):
+            seen.update(env)
+            return real([sys.executable, "-c", "pass"], **kw)
+        run_worker.subprocess.Popen = fake
+        self.addCleanup(setattr, run_worker.subprocess, "Popen", real)
+        job.start()
+        job.proc.wait()
+        job.reader.join()
+        self.assertNotIn("OS_MAINT_PASSWORD", seen)
+
+
 class WorkerProgressTest(unittest.TestCase):
     """Running totals, read from the status file a crawler writes."""
 
@@ -437,6 +688,14 @@ class WorkerProgressTest(unittest.TestCase):
         self.assertEqual(job.progress(), "1,204 indexed · 18,330 unchanged · 19,601 found")
         self.write("smb-fin", {"indexed": 1, "skipped_unchanged": 2, "skipped_excluded": 3, "discovered": 6})
         self.assertEqual(job.progress(), "1 indexed · 2 unchanged · 3 excluded · 6 found")
+
+    def test_index_job_progress(self):
+        job = self.rw.Job({"id": 2, "type": "index", "op": {"action": "rebuild"}})
+        self.addCleanup(job.cleanup)
+        self.assertEqual(job.progress(), "")
+        with open(os.path.join(self.dir, "status-index.json"), "w") as f:
+            json.dump({"progress": "12,000 of 91,598 documents copied (13%)"}, f)
+        self.assertEqual(job.progress(), "12,000 of 91,598 documents copied (13%)")
 
     def test_acl_totals_and_stale_files(self):
         job = self.job("acl")
@@ -483,6 +742,21 @@ class LdapHelpersTest(unittest.TestCase):
     def test_cn_from_dn(self):
         self.assertEqual(cn_from_dn("CN=Domain Admins,CN=Users,DC=example,DC=local"), "Domain Admins")
         self.assertEqual(cn_from_dn("CN=Smith\\, John,OU=People,DC=x"), "Smith, John")
+
+    def test_refused_bind_is_a_wrong_password_not_an_outage(self):
+        from unittest import mock
+        from ldap3.core.exceptions import LDAPInvalidCredentialsResult, LDAPSocketOpenError
+        from ldap_auth import LdapAuth, LookupFailed
+        auth = LdapAuth("ldap://dc.example.local", "{username}@example.local", "DC=example,DC=local",
+                        lookup_user="svc-lookup", lookup_password="pw")
+        with mock.patch.object(LdapAuth, "_connect", side_effect=LDAPInvalidCredentialsResult(result=49)):
+            with self.assertRaisesRegex(SignInFailed, "invalid credentials"):
+                auth.authenticate("alice", "wrong")
+            with self.assertRaisesRegex(LookupFailed, "refused"):
+                auth.lookup("alice")
+        with mock.patch.object(LdapAuth, "_connect", side_effect=LDAPSocketOpenError("no route")):
+            with self.assertRaisesRegex(LookupFailed, "unavailable"):
+                auth.lookup("alice")
 
     def test_primary_group_sid(self):
         # S-1-5-21-1-2-3-1104 as AD stores it.

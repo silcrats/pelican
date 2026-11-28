@@ -32,6 +32,7 @@ import urllib.request
 from urllib.parse import parse_qs, unquote, urlparse
 
 import store as store_mod
+from access import RoleRules, visible_counts
 from storage import Storage
 from store import FIELDS, KIND_INFO, KINDS, Forbidden, Invalid, NotFound
 
@@ -108,7 +109,9 @@ def _make_ldap():
     return LdapAuth(os.environ["LDAP_URL"], os.environ.get("LDAP_BIND_TEMPLATE", "{username}"),
                     os.environ.get("LDAP_BASE_DN", ""), os.environ.get("LDAP_USERNAME_ATTR") or "sAMAccountName",
                     start_tls=os.environ.get("LDAP_START_TLS", "").lower() in ("1", "true", "yes"),
-                    ca_file=os.environ.get("LDAP_CA_FILE", ""))
+                    ca_file=os.environ.get("LDAP_CA_FILE", ""),
+                    lookup_user=os.environ.get("LDAP_LOOKUP_USER", ""),
+                    lookup_password=os.environ.get("LDAP_LOOKUP_PASSWORD", ""))
 
 
 def write_exports(st: store_mod.Store) -> None:
@@ -149,28 +152,92 @@ def import_existing(st: store_mod.Store) -> None:
         st.db.commit()
 
 
-def doc_count(kind: str, name: str) -> int | None:
-    if not OS_HOST:
-        return None
-    body = json.dumps({"query": {"bool": {"filter": [{"term": {"share": name}},
-                                                     {"term": {"host": SOURCE_HOSTS[kind]}}]}}}).encode()
-    req = urllib.request.Request(f"{OS_HOST}/{SEARCH_INDEX}/_count", data=body, method="POST",
+def os_post(path: str, body: dict | None, timeout: int = 10, method: str = "POST") -> dict:
+    """Call OpenSearch with the portal's read-only account."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(f"{OS_HOST}{path}", data=data, method=method,
                                  headers={"Content-Type": "application/json"})
     if OS_USERNAME:
         req.add_header("Authorization", "Basic " + base64.b64encode(f"{OS_USERNAME}:{OS_PASSWORD}".encode()).decode())
+    with urllib.request.urlopen(req, timeout=timeout, context=_SSL if OS_HOST.startswith("https") else None) as r:
+        return json.load(r)
+
+
+def os_get(path: str, timeout: int = 10) -> dict | None:
+    """GET from OpenSearch; None for a 404."""
     try:
-        with urllib.request.urlopen(req, timeout=10, context=_SSL if OS_HOST.startswith("https") else None) as r:
-            return int(json.load(r)["count"])
+        return os_post(path, None, timeout, "GET")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+
+
+VECTOR_FIELD = "content_embedding"
+
+
+def index_state(get=os_get, post=os_post) -> dict:
+    """Which index searches use, and each numbered copy of it: documents,
+    size, and how its vectors were made (from the _meta a rebuild records,
+    else from its mapping)."""
+    alias = SEARCH_INDEX
+    # Keyed by the real index: the name itself while it's a plain index.
+    # (/_alias/<name> would need rights on every index.)
+    live = next(iter(get(f"/{alias}/_alias") or {}), None)
+    plain = live == alias
+    names = f"{alias},{alias}-*"
+    mappings = get(f"/{names}/_mapping?ignore_unavailable=true&allow_no_indices=true") or {}
+    stats = (get(f"/{names}/_stats/store?ignore_unavailable=true&allow_no_indices=true") or {}).get("indices") or {}
+    out = []
+    for name in sorted(mappings, key=lambda n: (n != live, n)):
+        m = mappings[name].get("mappings") or {}
+        props = m.get("properties") or {}
+        meta = (m.get("_meta") or {}).get("pelican") or {}
+        knn = ((props.get(VECTOR_FIELD) or {}).get("properties") or {}).get("knn") or {}
+        out.append({
+            "name": name, "live": name == live, "built": bool(meta), "meta": meta,
+            "vectors": bool(knn), "dimension": knn.get("dimension"),
+            # Not the stats' document count: that includes each passage vector.
+            "docs": post(f"/{name}/_count", {"query": {"match_all": {}}}).get("count"),
+            "bytes": ((stats.get(name) or {}).get("total") or {}).get("store", {}).get("size_in_bytes"),
+        })
+    # Left by a rebuild whose worker stopped: before the first switch there
+    # are no numbered indexes; after it, all but the previous have been live.
+    leftovers = [i["name"] for i in out if i["name"] != alias and not i["live"]
+                 and (plain or (i["built"] and not i["meta"].get("switched_at")))]
+    blocked = False
+    if plain:
+        found = get(f"/{alias}/_settings/index.blocks.write") or {}
+        blocked = str((((found.get(alias) or {}).get("settings") or {}).get("index") or {})
+                      .get("blocks", {}).get("write")) == "true"
+    with_vectors = None
+    live_row = next((i for i in out if i["live"]), None)
+    if live_row and live_row["vectors"]:
+        with_vectors = post(f"/{alias}/_count", {"query": {"nested": {
+            "path": VECTOR_FIELD, "query": {"exists": {"field": f"{VECTOR_FIELD}.knn"}}}}})["count"]
+    return {"alias": alias, "live": live, "plain": plain, "indexes": out, "with_vectors": with_vectors,
+            "leftovers": leftovers, "blocked": blocked}
+
+
+def doc_count(kind: str, name: str) -> int | None:
+    if not OS_HOST:
+        return None
+    try:
+        return int(os_post(f"/{SEARCH_INDEX}/_count", {"query": {"bool": {"filter": [
+            {"term": {"share": name}}, {"term": {"host": SOURCE_HOSTS[kind]}}]}}})["count"])
     except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
         print(f"document count for {name} failed: {exc}")
         return None
 
 
 class App:
-    def __init__(self, st: store_mod.Store, ldap=None, storage: Storage | None = None):
+    def __init__(self, st: store_mod.Store, ldap=None, storage: Storage | None = None, os_search=None,
+                 role_rules: RoleRules | None = None):
         self.store = st
         self.ldap = ldap
         self.storage = storage
+        self.os_search = os_search if os_search is not None else (os_post if OS_HOST else None)
+        self.role_rules = role_rules or RoleRules.from_env()
         self.storage_refreshed = 0.0
         self.sessions: dict[str, dict] = {}
         self.sessions_lock = threading.Lock()
@@ -268,6 +335,127 @@ class App:
             return {"jobs": jobs[:200], "workers": workers, "default_slots": st.default_worker_slots(),
                     "max_slots": store_mod.MAX_WORKER_SLOTS, "now": time.time()}
 
+
+    # ------------------------------------------------------------ index
+
+    def index_view(self, user) -> dict:
+        """The Index page: the live index and its copies, the vector settings
+        the next rebuild uses, recent index jobs, and what may be done now."""
+        if not user.super_admin:
+            raise Forbidden()
+        st = self.store
+        with st.lock:
+            out = {"settings": st.vector_settings(), "jobs": st.index_jobs(),
+                   "holding": st.holding(), "now": time.time()}
+            out["held"] = st._one("SELECT COUNT(*) AS n FROM jobs WHERE status='queued' AND type IN"
+                                  " ('crawl','acl','purge')")["n"] if out["holding"] else 0
+        if not OS_HOST:
+            out["state_error"] = "The portal has no OpenSearch account (OS_HOST), so it can't show the index."
+            return out
+        try:
+            out["state"] = index_state()
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+            print(f"index state failed: {exc}")
+            out["state_error"] = ("OpenSearch couldn't be asked about the index. If this portal was set up before "
+                                  "the Index page, re-run the opensearch-users job to give pelican-status "
+                                  "its new permissions.")
+            return out
+        if any(j["status"] in ("queued", "running") for j in out["jobs"]):
+            # A rebuild under way looks just like one that stopped half-way.
+            out["state"]["leftovers"], out["state"]["blocked"] = [], False
+        out.update(self._index_choices(out["state"]))
+        return out
+
+    def _index_choices(self, state: dict) -> dict:
+        """Whether switching back is possible, and why not."""
+        previous = [i for i in state["indexes"] if not i["live"] and i["name"] != state["alias"]
+                    and i["name"] not in state.get("leftovers", [])]
+        if state["plain"] or not previous:
+            return {"previous": None, "switch_back": False, "switch_back_why": "There's no previous index."}
+        with self.store.lock:
+            last = self.store._one("SELECT MAX(finished_at) AS t FROM index_jobs WHERE status='done'"
+                                   " AND action IN ('rebuild','switch_back')")["t"]
+            since = self.store.writes_since(last) if last else []
+        why = ""
+        if since:
+            why = (f"Crawls, ACL syncs or removals have run since the switch ({len(since)} job"
+                   f"{'s' if len(since) != 1 else ''}). The previous index doesn't have their changes, and the "
+                   "crawlers wouldn't know to make them again.")
+        elif not last:
+            why = "The switch to the live index wasn't made from this portal, so it can't tell what has changed since."
+        return {"previous": max(previous, key=lambda i: i["name"])["name"], "switch_back": not why,
+                "switch_back_why": why}
+
+    def request_index_job(self, user, action: str) -> dict:
+        if not user.super_admin:
+            raise Forbidden()
+        if action != "check":
+            if not OS_HOST:
+                raise Invalid("the portal has no OpenSearch account (OS_HOST), so it can't check the index first")
+            try:
+                state = index_state()
+            except (urllib.error.URLError, OSError, ValueError, KeyError):
+                raise Invalid("OpenSearch couldn't be asked about the index; try again shortly")
+            choices = self._index_choices(state)
+            if action == "rebuild" and not state["live"]:
+                raise Invalid("there's no index yet: crawl a source first")
+            if action == "switch_back" and not choices["switch_back"]:
+                raise Invalid(choices["switch_back_why"])
+            if action == "drop_previous" and not choices["previous"]:
+                raise Invalid("there's no previous index")
+        return self.store.request_index_job(user, action)
+
+    # ----------------------------------------------------------- access
+
+    def access_available(self) -> dict:
+        lookup = bool(self.ldap and getattr(self.ldap, "can_look_up", lambda: False)())
+        return {"lookup": lookup, "counts": bool(self.os_search)}
+
+    def check_access(self, user, username: str) -> dict:
+        """What `username` can see in search: their groups and roles as
+        Frogmouth builds them, and per source how many documents those
+        roles open. Scoped admins get only their own sources' rows."""
+        from ldap_auth import LookupFailed
+        avail = self.access_available()
+        if not avail["lookup"]:
+            raise Invalid("the access check needs a directory lookup account (LDAP_LOOKUP_USER, LDAP_LOOKUP_PASSWORD)")
+        username = username.strip()
+        if not username:
+            raise Invalid("enter a username")
+        try:
+            account = self.ldap.lookup(username)
+        except LookupFailed as exc:
+            print(f"access check for {username!r}: {exc}")
+            raise Invalid(f"couldn't read the directory: {exc}")
+        with self.store.lock:
+            self.store.audit(user.username, "check access", username,
+                             detail={"found": account is not None})
+            self.store.db.commit()
+        if account is None:
+            return {"found": False, "username": username, **avail}
+        roles = self.role_rules.roles(account["username"], account["groups"])
+        out = {"found": True, **avail, **account, "roles": roles, "sources": [], "outside": None}
+        if not self.os_search:
+            return out
+        try:
+            counts = visible_counts(self.os_search, SEARCH_INDEX, [r["role"] for r in roles])
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+            print(f"access counts for {username!r} failed: {exc}")
+            out["counts_error"] = "OpenSearch couldn't be asked for document counts."
+            return out
+        with self.store.lock:
+            sources = self.store.visible_sources(user)
+            portal_keys = {(s["name"], SOURCE_HOSTS[s["kind"]]) for s in self.store.all_sources()}
+        for s in sorted(sources, key=lambda s: s["name"].lower()):
+            row = counts.get((s["name"], SOURCE_HOSTS[s["kind"]]), {"total": 0, "visible": 0, "by_role": {}})
+            out["sources"].append({"source_id": s["id"], "name": s["name"], "kind": s["kind"], **row})
+        if user.super_admin:
+            # Documents from sources the portal doesn't manage (crawled from YAML, or left behind).
+            rest = [v for k, v in counts.items() if k not in portal_keys]
+            if rest:
+                out["outside"] = {"sources": len(rest), "total": sum(v["total"] for v in rest),
+                                  "visible": sum(v["visible"] for v in rest)}
+        return out
 
     # ---------------------------------------------------------- storage
 
@@ -459,16 +647,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/worker/claim":
             job = st.claim(worker, int(body.get("running") or 0), str(body.get("version") or "")[:40])
             return self._send(200, _json({"job": job, "slots": st.worker_slots(worker)}))
-        m = re.fullmatch(r"/api/worker/jobs/(\d+)/(heartbeat|finish)", path)
+        m = re.fullmatch(r"/api/worker/(jobs|index-jobs)/(\d+)/(heartbeat|finish)", path)
         if not m:
             return self._error(404, "not found")
-        job_id = int(m.group(1))
+        job_id = int(m.group(2))
+        index = m.group(1) == "index-jobs"
         try:
-            if m.group(2) == "heartbeat":
-                return self._send(200, _json(st.heartbeat(worker, job_id, str(body.get("log") or ""),
-                                                          progress=str(body.get("progress") or ""))))
-            st.finish(worker, job_id, bool(body.get("ok")), body.get("exit_code"),
-                      str(body.get("log") or ""), str(body.get("summary") or ""))
+            if m.group(3) == "heartbeat":
+                beat = st.index_heartbeat if index else st.heartbeat
+                return self._send(200, _json(beat(worker, job_id, str(body.get("log") or ""),
+                                                  progress=str(body.get("progress") or ""))))
+            (st.index_finish if index else st.finish)(
+                worker, job_id, bool(body.get("ok")), body.get("exit_code"),
+                str(body.get("log") or ""), str(body.get("summary") or ""))
             return self._send(200, _json({"ok": True}))
         except Invalid as exc:
             return self._error(409, str(exc))
@@ -543,6 +734,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 job = st.job(job_id)
                 st.managed_source(user, job["source_id"])
                 return self._send(200, _json(job))
+
+        if path == "/api/access" and method == "GET":
+            who = (qs.get("user") or [""])[0]
+            if not who:
+                return self._send(200, _json(app.access_available()))
+            return self._send(200, _json(app.check_access(user, who)))
+
+        if path == "/api/index" and method == "GET":
+            return self._send(200, _json(app.index_view(user)))
+        if path == "/api/index/settings" and method == "PUT":
+            if not user.super_admin:
+                raise Forbidden()
+            return self._send(200, _json(st.save_vector_settings(user, self._body())))
+        if path == "/api/index/jobs" and method == "POST":
+            return self._send(200, _json(app.request_index_job(user, str(self._body().get("action") or ""))))
+        m = re.fullmatch(r"/api/index/jobs/(\d+)(/cancel)?", path)
+        if m:
+            if not user.super_admin:
+                raise Forbidden()
+            if m.group(2) and method == "POST":
+                return self._send(200, _json(st.cancel_index_job(user, int(m.group(1)))))
+            if not m.group(2) and method == "GET":
+                return self._send(200, _json(st.index_job(int(m.group(1)))))
 
         if path == "/api/storage" and method == "GET":
             return self._send(200, _json(app.storage_view(user)))
@@ -622,7 +836,9 @@ def main():
     for key, env in (("crawl_minutes", "DEFAULT_CRAWL_MINUTES"), ("acl_minutes", "DEFAULT_ACL_MINUTES")):
         if os.environ.get(env):
             defaults[key] = int(os.environ[env])
-    st = store_mod.Store(DB_PATH, SUPER_ADMIN_GROUPS, defaults)
+    vector_defaults = {k: os.environ[env] for k, env in (("embeddings_url", "EMBEDDINGS_URL"),
+                                                          ("model", "EMBEDDINGS_MODEL")) if os.environ.get(env)}
+    st = store_mod.Store(DB_PATH, SUPER_ADMIN_GROUPS, defaults, vector_defaults)
     st.on_change = lambda: write_exports(st)
     import_existing(st)
     write_exports(st)

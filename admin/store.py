@@ -92,6 +92,18 @@ MIN_INTERVAL_MINUTES = 5          # the shortest schedule anyone can set
 DEFAULT_SCOPE_MIN_MINUTES = 60    # a new scope's shortest schedule
 LEASE_SECONDS = 120               # a running job with no heartbeat for this long has lost its worker
 DEFAULT_WORKER_SLOTS = 2         # jobs a worker runs at once, unless a super admin changes it
+INDEX_JOBS_KEPT = 50
+# Index jobs (see rebuild_index.py). Those that change which index searches
+# use hold every crawl, ACL sync and removal until they end, so nothing is
+# written to the index meanwhile; they start once none is running.
+INDEX_ACTIONS = ("check", "rebuild", "switch_back", "drop_previous", "tidy")
+HOLDING_ACTIONS = ("rebuild", "switch_back")
+# Vector settings a rebuild uses, until a super admin saves others. The
+# embeddings server and model default to the portal's EMBEDDINGS_URL and
+# EMBEDDINGS_MODEL (as in config/pelican.yaml).
+VECTOR_DEFAULTS = {"enabled": False, "embeddings_url": "http://embeddings/embed",
+                   "model": "BAAI/bge-base-en-v1.5", "chunk_words": 300, "chunk_overlap": 0.1, "max_chunks": 100}
+URL_RE = re.compile(r"^https?://[A-Za-z0-9.-]+(:\d{1,5})?(/[^\s]*)?$")
 MAX_WORKER_SLOTS = 16
 WORKER_FORGET_SECONDS = 3600     # a worker not heard from for this long leaves the list
 PURGE_RETRY_SECONDS = 300        # a failed removal is tried again after this
@@ -134,6 +146,16 @@ CREATE TABLE IF NOT EXISTS workers (
     name TEXT PRIMARY KEY, last_seen REAL, slots INTEGER, running INTEGER, version TEXT);
 -- Super admins' per-worker settings; kept when a worker leaves the list.
 CREATE TABLE IF NOT EXISTS worker_settings (name TEXT PRIMARY KEY, slots INTEGER);
+-- Index jobs (Index page): not about one source, so kept apart from jobs.
+CREATE TABLE IF NOT EXISTS index_jobs (
+    id INTEGER PRIMARY KEY,
+    action TEXT NOT NULL,
+    op TEXT NOT NULL,
+    status TEXT NOT NULL,
+    requested_by TEXT,
+    created_at REAL, started_at REAL, finished_at REAL,
+    worker TEXT, lease_until REAL, cancel INTEGER NOT NULL DEFAULT 0,
+    exit_code INTEGER, log TEXT, summary TEXT);
 CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY, at REAL, user TEXT, action TEXT,
     scope_id INTEGER, target TEXT, detail TEXT);
@@ -187,8 +209,10 @@ def _dump_yaml(data) -> str:
 
 
 class Store:
-    def __init__(self, path: str, admin_groups=(), defaults: dict | None = None):
+    def __init__(self, path: str, admin_groups=(), defaults: dict | None = None,
+                 vector_defaults: dict | None = None):
         self.path = path
+        self.vector_defaults = {**VECTOR_DEFAULTS, **(vector_defaults or {})}
         self.admin_groups = [g for g in admin_groups if g]
         self.defaults = {"crawl_minutes": 360, "acl_minutes": 120}
         self.defaults.update(defaults or {})
@@ -746,14 +770,17 @@ class Store:
                     self._insert_job(s["id"], job_type, "schedule", now)
 
     def _expire_leases(self, now: float) -> None:
-        for r in self._q("SELECT id, worker FROM jobs WHERE status='running' AND lease_until < ?", (now,)):
-            self.db.execute("UPDATE jobs SET status='failed', finished_at=?, summary=? WHERE id=?",
-                            (now, f"worker {r['worker']} stopped responding", r["id"]))
+        for table in ("jobs", "index_jobs"):
+            for r in self._q(f"SELECT id, worker FROM {table} WHERE status='running' AND lease_until < ?", (now,)):
+                self.db.execute(f"UPDATE {table} SET status='failed', finished_at=?, summary=? WHERE id=?",
+                                (now, f"worker {r['worker']} stopped responding", r["id"]))
 
     def claim(self, worker: str, running: int, version: str = "", now: float | None = None) -> dict | None:
         """Hands the next due job to a worker, or None. A worker runs at most
-        worker_slots(worker) jobs at once. A purge waits until nothing else
-        runs for its source; test and purge jobs go first."""
+        worker_slots(worker) jobs at once. Index jobs go first; a purge waits
+        until nothing else runs for its source; then test and purge jobs.
+        While a rebuild or switch is queued or running, no crawl, ACL sync or
+        removal starts (tests still do)."""
         now = now or time.time()
         with self.lock:
             slots = self.worker_slots(worker)
@@ -762,10 +789,15 @@ class Store:
             self._enqueue_due(now)
             job = None
             if running < slots:
+                job = self._claim_index_job(worker, now)
+            holding = self.holding()
+            if running < slots and job is None:
                 # created_at in the future: a retry that isn't due yet.
                 rows = self._q("SELECT * FROM jobs WHERE status='queued' AND created_at <= ? ORDER BY"
                                " CASE type WHEN 'test' THEN 0 WHEN 'purge' THEN 1 ELSE 2 END, created_at, id", (now,))
                 for r in rows:
+                    if holding and r["type"] != "test":
+                        continue
                     source = self.source(r["source_id"])
                     busy = self._one("SELECT 1 FROM jobs WHERE source_id=? AND status='running'"
                                      + ("" if r["type"] == "purge" else " AND type=?"),
@@ -830,6 +862,158 @@ class Store:
             self.db.commit()
         if job["type"] == "purge" and ok:
             self.on_change()
+
+    # ------------------------------------------------------- index jobs
+
+    def vector_settings(self) -> dict:
+        """What the next rebuild uses: saved on the Index page, else the defaults."""
+        saved = self.meta("vector_settings")
+        return {**self.vector_defaults, **(json.loads(saved) if saved else {})}
+
+    def save_vector_settings(self, user: User, body: dict) -> dict:
+        if not user.super_admin:
+            raise Forbidden()
+        out = dict(self.vector_settings())
+        if "enabled" in body:
+            out["enabled"] = bool(body["enabled"])
+        url = str(body.get("embeddings_url", out["embeddings_url"])).strip()
+        if not URL_RE.match(url):
+            raise Invalid("the embeddings server must be an http:// or https:// address, "
+                          "e.g. http://embeddings/embed")
+        model = str(body.get("model", out["model"])).strip()
+        if not model or len(model) > 200 or any(c.isspace() for c in model):
+            raise Invalid("name the model the embeddings server runs, e.g. BAAI/bge-base-en-v1.5")
+
+        def number(key, cast, low, high, what):
+            try:
+                value = cast(body.get(key, out[key]))
+            except (TypeError, ValueError):
+                raise Invalid(f"{what} must be a number")
+            if not low <= value <= high:
+                raise Invalid(f"{what} must be between {low} and {high}")
+            return value
+        out.update({
+            "embeddings_url": url, "model": model,
+            "chunk_words": number("chunk_words", int, 50, 2000, "passage size"),
+            "chunk_overlap": number("chunk_overlap", float, 0, 0.5, "overlap"),
+            "max_chunks": number("max_chunks", int, 1, 1000, "passages per document"),
+        })
+        with self.lock:
+            before = self.vector_settings()
+            self.set_meta("vector_settings", json.dumps(out))
+            if before != out:
+                self.audit(user.username, "vector settings changed", "index", None, {"before": before, "after": out})
+            self.db.commit()
+        return out
+
+    def _index_job_row(self, row) -> dict:
+        job = {k: row[k] for k in row.keys()}
+        job["op"] = json.loads(job["op"])
+        return job
+
+    def index_jobs(self, limit=20) -> list[dict]:
+        return [self._index_job_row(r) for r in self._q("SELECT * FROM index_jobs ORDER BY id DESC LIMIT ?", (limit,))]
+
+    def index_job(self, job_id) -> dict:
+        row = self._one("SELECT * FROM index_jobs WHERE id = ?", (job_id,))
+        if not row:
+            raise NotFound("no such index job")
+        return self._index_job_row(row)
+
+    def holding(self) -> bool:
+        """Whether a rebuild or switch is queued or running, holding crawls."""
+        marks = ",".join("?" * len(HOLDING_ACTIONS))
+        return bool(self._one(f"SELECT 1 FROM index_jobs WHERE status IN ('queued','running')"
+                              f" AND action IN ({marks})", HOLDING_ACTIONS))
+
+    def writes_since(self, since: float) -> list[dict]:
+        """Crawls, ACL syncs and removals that started after `since`: they wrote
+        to the live index, which switching back would lose."""
+        return [self._job_row(r) for r in self._q(
+            "SELECT * FROM jobs WHERE type IN ('crawl','acl','purge') AND started_at >= ?", (since,))]
+
+    def request_index_job(self, user: User, action: str) -> dict:
+        """Queue an index job. The caller checks against the live index that
+        it makes sense (e.g. that there's a previous index to switch to)."""
+        if not user.super_admin:
+            raise Forbidden()
+        if action not in INDEX_ACTIONS:
+            raise Invalid("unknown index job")
+        with self.lock:
+            if self._one("SELECT 1 FROM index_jobs WHERE status IN ('queued','running')"):
+                raise Invalid("another index job is queued or running; wait for it to finish")
+            vs = self.vector_settings()
+            op = {"action": action, "requested_by": user.username}
+            if action == "check":
+                op["vectors"] = {k: vs[k] for k in VECTOR_DEFAULTS if k != "enabled"}
+            elif action == "rebuild":
+                op["vectors"] = {k: vs[k] for k in VECTOR_DEFAULTS if k != "enabled"} if vs["enabled"] else None
+            cur = self.db.execute(
+                "INSERT INTO index_jobs (action, op, status, requested_by, created_at) VALUES (?, ?, 'queued', ?, ?)",
+                (action, json.dumps(op), user.username, time.time()))
+            self.audit(user.username, f"index {action.replace('_', ' ')} requested", "index", None,
+                       {"vectors": op.get("vectors")} if "vectors" in op else None)
+            self.db.commit()
+            return self.index_job(cur.lastrowid)
+
+    def cancel_index_job(self, user: User, job_id) -> dict:
+        if not user.super_admin:
+            raise Forbidden()
+        with self.lock:
+            job = self.index_job(job_id)
+            if job["status"] == "queued":
+                self.db.execute("UPDATE index_jobs SET status='cancelled', finished_at=? WHERE id=?",
+                                (time.time(), job_id))
+            elif job["status"] == "running":
+                self.db.execute("UPDATE index_jobs SET cancel=1 WHERE id=?", (job_id,))
+            else:
+                raise Invalid("that job has finished")
+            self.audit(user.username, f"index {job['action'].replace('_', ' ')} cancelled", "index")
+            self.db.commit()
+            return self.index_job(job_id)
+
+    def _claim_index_job(self, worker: str, now: float) -> dict | None:
+        row = self._one("SELECT * FROM index_jobs WHERE status='queued' ORDER BY id LIMIT 1")
+        if not row:
+            return None
+        if row["action"] in HOLDING_ACTIONS and self._one(
+                "SELECT 1 FROM jobs WHERE status='running' AND type IN ('crawl','acl','purge')"):
+            return None   # waits for running crawls to finish
+        self.db.execute("UPDATE index_jobs SET status='running', worker=?, started_at=?, lease_until=? WHERE id=?",
+                        (worker, now, now + LEASE_SECONDS, row["id"]))
+        return {"id": row["id"], "type": "index", "op": json.loads(row["op"])}
+
+    def _owned_index_job(self, worker: str, job_id) -> dict:
+        job = self.index_job(job_id)
+        if job["status"] != "running" or job["worker"] != worker:
+            raise Invalid("this job is no longer yours")
+        return job
+
+    def index_heartbeat(self, worker: str, job_id, log: str = "", now: float | None = None,
+                        progress: str = "") -> dict:
+        now = now or time.time()
+        with self.lock:
+            job = self._owned_index_job(worker, job_id)
+            self.db.execute("UPDATE index_jobs SET lease_until=?, log=?, summary=COALESCE(?, summary) WHERE id=?",
+                            (now + LEASE_SECONDS, (log or "")[-JOB_LOG_CHARS:], (progress or None) and progress[:500],
+                             job_id))
+            self.db.execute("UPDATE workers SET last_seen=? WHERE name=?", (now, worker))
+            self.db.commit()
+            return {"cancel": bool(job["cancel"])}
+
+    def index_finish(self, worker: str, job_id, ok: bool, exit_code=None, log: str = "", summary: str = "",
+                     now: float | None = None) -> None:
+        now = now or time.time()
+        with self.lock:
+            job = self._owned_index_job(worker, job_id)
+            status = "done" if ok else ("cancelled" if job["cancel"] else "failed")
+            self.db.execute("UPDATE index_jobs SET status=?, finished_at=?, exit_code=?, log=?, summary=? WHERE id=?",
+                            (status, now, exit_code, (log or "")[-JOB_LOG_CHARS:], (summary or "")[:500], job_id))
+            self.audit("worker:" + worker, f"index {job['action'].replace('_', ' ')} {status}", "index", None,
+                       {"summary": summary})
+            self.db.execute("DELETE FROM index_jobs WHERE id NOT IN (SELECT id FROM index_jobs ORDER BY id DESC"
+                            " LIMIT ?)", (INDEX_JOBS_KEPT,))
+            self.db.commit()
 
     # ---------------------------------------------------- worker settings
 

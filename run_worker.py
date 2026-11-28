@@ -1,6 +1,6 @@
 """
 Pelican worker: a long-running process that asks the admin portal for due
-jobs (crawls, ACL syncs, connection tests, removals) and runs them as the
+jobs (crawls, ACL syncs, connection tests, removals, index rebuilds) and runs them as the
 ordinary one-shot scripts, as many at a time as the portal allows (set on
 its Activity page). Replaces the scheduler and the one container per job:
 to crawl more in parallel, allow more jobs at once or start more workers.
@@ -83,6 +83,8 @@ SCRIPTS = {
 }
 # Never handed on to a job: it only lets the worker talk to the portal.
 PRIVATE_ENV = ("WORKER_TOKEN",)
+# Only handed to index jobs (rebuild_index.py), which use nothing else of OpenSearch.
+MAINT_ENV = ("OS_MAINT_USERNAME", "OS_MAINT_PASSWORD")
 
 
 def _version() -> str:
@@ -110,9 +112,12 @@ class Job:
     def __init__(self, spec: dict):
         self.spec = spec
         self.id = spec["id"]
-        self.kind = spec["source"]["kind"]
-        self.name = spec["source"]["name"]
         self.type = spec["type"]
+        # Index jobs (the portal's Index page) aren't about one source.
+        source = spec.get("source") or {"kind": "index", "name": "index"}
+        self.kind = source["kind"]
+        self.name = source["name"]
+        self.api = "index-jobs" if self.type == "index" else "jobs"
         self.log = collections.deque()
         self.log_chars = 0
         self.lock = threading.Lock()
@@ -127,6 +132,8 @@ class Job:
         self.started_at = time.time()
 
     def command(self) -> list[str]:
+        if self.type == "index":
+            return [sys.executable, "-u", "rebuild_index.py"]
         if self.type == "test":
             return [sys.executable, "-u", "check_source.py", self.kind, self.name]
         if self.type == "purge":
@@ -137,22 +144,33 @@ class Job:
         return [sys.executable, "-u", *script]
 
     def start(self) -> None:
-        config_path = os.path.join(self.tmpdir, "source.yaml")
-        with open(config_path, "w") as f:   # mkdtemp's directory is private to this user
-            f.write(self.spec["config_yaml"])
-        env = {k: v for k, v in os.environ.items() if k not in PRIVATE_ENV}
-        env.update({
-            self.spec["config_env"]: config_path,
-            self.spec["names_env"]: self.name,
-            "JOB_NAME": self.job_name,
-            "STATE_DB_PATH": os.path.join(STATE_DIR, self.kind, "pelican_state.db"),
-        })
+        if self.type == "index":
+            env = {k: v for k, v in os.environ.items()
+                   if k not in PRIVATE_ENV and k not in ("OS_USERNAME", "OS_PASSWORD")}
+            env["INDEX_OP"] = json.dumps(self.spec["op"])
+            try:
+                os.unlink(self.status_path())   # so no earlier job's progress shows
+            except OSError:
+                pass
+        else:
+            config_path = os.path.join(self.tmpdir, "source.yaml")
+            with open(config_path, "w") as f:   # mkdtemp's directory is private to this user
+                f.write(self.spec["config_yaml"])
+            env = {k: v for k, v in os.environ.items() if k not in PRIVATE_ENV and k not in MAINT_ENV}
+            env.update({
+                self.spec["config_env"]: config_path,
+                self.spec["names_env"]: self.name,
+                "JOB_NAME": self.job_name,
+                "STATE_DB_PATH": os.path.join(STATE_DIR, self.kind, "pelican_state.db"),
+            })
         self.proc = subprocess.Popen(self.command(), cwd=APP_DIR, env=env, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, text=True, errors="replace", bufsize=1,
                                      start_new_session=True)
         self.reader = threading.Thread(target=self._read_output, daemon=True)
         self.reader.start()
-        print(f"[job {self.id}] started {self.type} of {self.kind} source {self.name}", flush=True)
+        what = f"index job ({self.spec['op'].get('action')})" if self.type == "index" else \
+            f"{self.type} of {self.kind} source {self.name}"
+        print(f"[job {self.id}] started {what}", flush=True)
 
     def _read_output(self) -> None:
         for line in self.proc.stdout:
@@ -175,15 +193,19 @@ class Job:
     def progress(self) -> str:
         """Running totals from the status file the crawler writes, e.g.
         "1,204 indexed · 18,330 unchanged · 19,601 found"; "" before it
-        has written one this run, and for tests and removals."""
-        if self.type not in ("crawl", "acl"):
+        has written one this run, and for tests and removals. Index jobs
+        write a line of their own ("12,000 of 91,598 documents copied")."""
+        if self.type not in ("crawl", "acl", "index"):
             return ""
-        path = os.path.join(STATUS_DIR, f"status-{self.job_name}.json")
+        path = self.status_path()
         try:
             if os.path.getmtime(path) < self.started_at - 1:
                 return ""   # left from an earlier run
             with open(path) as f:
-                s = (json.load(f).get("shares") or {}).get(self.name)
+                data = json.load(f)
+            if self.type == "index":
+                return str(data.get("progress") or "")[:300]
+            s = (data.get("shares") or {}).get(self.name)
         except (OSError, ValueError, AttributeError):
             return ""
         if not s:
@@ -196,6 +218,10 @@ class Job:
             parts.append(f"{s['skipped_excluded']:,} excluded")
         parts.append(f"{s.get('discovered', 0):,} found")
         return " · ".join(parts)
+
+    def status_path(self) -> str:
+        return os.path.join(STATUS_DIR, "status-index.json" if self.type == "index"
+                            else f"status-{self.job_name}.json")
 
     def stop(self) -> None:
         """SIGTERM to the job's process group, then SIGKILL if it lingers."""
@@ -219,7 +245,7 @@ class Worker:
     def __init__(self):
         self.portal = Portal()
         self.jobs: dict[int, Job] = {}
-        self.unreported: list[tuple[int, dict]] = []   # finish reports the portal hasn't taken yet
+        self.unreported: list[tuple[str, int, dict]] = []   # finish reports the portal hasn't taken yet
         self.shutting_down = False
         self.slots: int | None = None   # jobs at once, as the portal last said
 
@@ -273,7 +299,7 @@ class Worker:
             job.start()
         except Exception as exc:
             job.cleanup()
-            self.unreported.append((job.id, {"ok": False, "exit_code": None, "log": str(exc),
+            self.unreported.append((job.api, job.id, {"ok": False, "exit_code": None, "log": str(exc),
                                              "summary": f"couldn't start: {exc}"}))
             return True
         self.jobs[job.id] = job
@@ -285,7 +311,7 @@ class Worker:
             if now - job.last_heartbeat < HEARTBEAT_SECONDS:
                 continue
             try:
-                r = self.portal.post(f"/api/worker/jobs/{job.id}/heartbeat",
+                r = self.portal.post(f"/api/worker/{job.api}/{job.id}/heartbeat",
                                      {"log": job.log_text(), "progress": job.progress()})
                 if r.status_code == 409:
                     print(f"[job {job.id}] the portal gave this job up; stopping it", flush=True)
@@ -313,25 +339,26 @@ class Worker:
             print(f"[job {job_id}] finished with exit status {code}", flush=True)
             if job.abandoned:
                 continue
-            # The totals when it worked; the last line (usually the error) when not.
-            summary = (code == 0 and job.progress()) or job.summary()
+            # A crawl's totals when it worked; otherwise the last line (an index
+            # job's result, or usually the error).
+            summary = (code == 0 and job.type != "index" and job.progress()) or job.summary()
             if code != 0 and job.stopping_since is not None:
                 summary = "stopped" + (" (worker shutting down)" if self.shutting_down else "")
-            self.unreported.append((job_id, {"ok": code == 0, "exit_code": code, "log": job.log_text(),
+            self.unreported.append((job.api, job_id, {"ok": code == 0, "exit_code": code, "log": job.log_text(),
                                              "summary": summary}))
 
     def _report(self) -> None:
         still = []
-        for job_id, body in self.unreported:
+        for api, job_id, body in self.unreported:
             try:
-                r = self.portal.post(f"/api/worker/jobs/{job_id}/finish", body)
+                r = self.portal.post(f"/api/worker/{api}/{job_id}/finish", body)
                 if r.status_code in (200, 409):   # 409: the portal already gave it up
                     continue
                 print(f"[job {job_id}] finish report refused: HTTP {r.status_code}", flush=True)
             except requests.RequestException as exc:
                 print(f"[job {job_id}] finish report failed: {exc}", flush=True)
             if not self.shutting_down:
-                still.append((job_id, body))
+                still.append((api, job_id, body))
         self.unreported = still
 
 

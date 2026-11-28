@@ -4,7 +4,7 @@ WORKDIR /app
 # --generate-hashes after changing it.
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt
-COPY admin_server.py store.py ldap_auth.py storage.py ./
+COPY admin_server.py store.py ldap_auth.py storage.py access.py ./
 COPY static ./static
 # /data holds the portal's database; /export the YAML files it writes for
 # Frogmouth and the mailbox permission export. Created here so new named

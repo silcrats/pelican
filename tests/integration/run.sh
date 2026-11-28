@@ -35,6 +35,7 @@ SMB_USER=pelican-test
 SMB_PASS=Smb-Test-Pw-1
 SMB_DOMAIN=
 WORKER_TOKEN=Itest-Worker-Token-0123456789abcdef
+OS_MAINT_PASSWORD='Itest-Maintainer-Pw-4!'
 ADMIN_BREAKGLASS_PASSWORD='$BREAKGLASS_PW'
 EOF
 SERVICES=(opensearch-users samba samba-encrypted)
@@ -358,6 +359,31 @@ check "portal writes shares.yaml for Frogmouth" \
   grep -q 'name: test-finance' <<< "$("${ADMIN_COMPOSE[@]}" exec -T admin cat /export/shares.yaml)"
 check "worker hides its portal token from jobs" \
   test "$("${ADMIN_COMPOSE[@]}" logs worker 2>/dev/null | grep -c Itest-Worker-Token)" = 0
+unfinished_rebuild_tidied() {
+  os_admin -XPUT https://localhost:9200/documents-9 \
+    -d '{"mappings": {"_meta": {"pelican": {"generation": 9}}, "properties": {"content": {"type": "text"}}}}' >/dev/null
+  local out rc
+  out=$(python3 tests/integration/admin_flow.py http://localhost:18091 "$BREAKGLASS_PW" tidy); rc=$?
+  echo "$out" | sed 's/^/  /'
+  [ "$rc" = 0 ]
+}
+check "an unfinished rebuild's leftovers are tidied up" unfinished_rebuild_tidied
+check "worker and portal have the CA certificate, not the OpenSearch admin key" \
+  test "$("${ADMIN_COMPOSE[@]}" exec -T worker ls /certs) $("${ADMIN_COMPOSE[@]}" exec -T admin ls /certs)" = "ca.pem ca.pem"
+if [ "${VECTOR:-}" = 1 ]; then
+  check "neural query as pelican-reader works through the rebuilt index's alias" \
+    test "$(reader_hits "$fixture_roles")" -gt 0
+  leftovers() {
+    local legacy models
+    legacy=$(os_admin -o /dev/null -w '%{http_code}' https://localhost:9200/_ingest/pipeline/pelican-embed)
+    models=$(os_admin -XPOST https://localhost:9200/_plugins/_ml/models/_search \
+      -d '{"size": 50, "query": {"term": {"algorithm": "REMOTE"}}}' \
+      | python3 -c 'import json, sys; print(sorted(h["_source"]["name"] for h in json.load(sys.stdin)["hits"]["hits"] if "model_group_id" in h["_source"]))')
+    echo "     .env pipeline: HTTP $legacy; models: $models"
+    [ "$legacy" = 404 ] && [ "$models" = "['pelican-embeddings-3']" ]
+  }
+  check "deleted indexes took their models and pipelines with them" leftovers
+fi
 
 echo
 if [ "$failures" -gt 0 ]; then
