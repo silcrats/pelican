@@ -214,7 +214,7 @@ services:
     restart: unless-stopped
 
   ofelia:
-    image: mcuadros/ofelia:0.3.22
+    image: mcuadros/ofelia:0.3.23
     command: daemon --docker
     environment:
       DOCKER_HOST: tcp://docker-api-proxy:2375
