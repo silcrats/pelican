@@ -12,7 +12,7 @@
 #   100-1.9.4      B200                 120-1.9.4     RTX 50xx
 services:
   embeddings:
-    image: ${EMBEDDINGS_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:86-1.9.4}
+    image: ${EMBEDDINGS_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:121-1.10.0}
     deploy:
       resources:
         reservations:
