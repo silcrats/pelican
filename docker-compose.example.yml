@@ -52,7 +52,7 @@ services:
   opensearch:
     # Pinned: OpenSearch upgrades its data on disk and can't be downgraded,
     # so move to a new version deliberately (and back up first).
-    image: opensearchproject/opensearch:3.9.0
+    image: opensearchproject/opensearch:3.10.1
     environment:
       - discovery.type=single-node
       - bootstrap.memory_lock=true
