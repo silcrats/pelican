@@ -5,8 +5,10 @@ proven reliable, sidestepping the kernel CIFS client entirely -- and keeps
 already-indexed documents in step when a directory's ACL changes.
 
 Mapping: a non-denied ACL entry for Everyone / Authenticated Users becomes
-the `everyone` role; any other principal becomes a group role named after
-it. An ACL with no usable grants (or a failed first lookup) becomes the
+the `everyone` role; a user account becomes that user's role (1<username>)
+and any other principal a group role named after it (2<name>). Whether a
+principal is a user is asked of the file server by SID (rpcclient
+lookupsids), cached for the life of the process. An ACL with no usable grants (or a failed first lookup) becomes the
 `restricted` role -- fail closed rather than open. See roles: in
 config/pelican.yaml.
 
@@ -18,6 +20,7 @@ per-file ACL overrides should set acl_scope: file in shares.yaml.
 """
 
 import os
+import re
 import sqlite3
 import subprocess
 import threading
@@ -41,6 +44,24 @@ ACL_RECHECK_SECONDS = int(float(os.environ.get("ACL_RECHECK_HOURS", "24")) * 360
 ACL_SYNC_WORKERS = int(os.environ.get("ACL_SYNC_WORKERS", "8"))
 
 _EVERYONE_PRINCIPALS = ("EVERYONE", "AUTHENTICATED USERS")
+_EVERYONE_SIDS = ("S-1-1-0", "S-1-5-11")
+
+# smbcacls --numeric ACE types that deny access (ACCESS_DENIED, ACCESS_DENIED_OBJECT).
+_DENIED_ACE_TYPES = ("1", "6")
+
+# SID_NAME_USE from lookupsids: 1 is a user account. Everything else (domain
+# group 2, alias 4, well-known group 5, unknown 8, computer 9...) is a group.
+_SID_TYPE_USER = 1
+
+# Samba's Unix-mapped SIDs: the server can't look them up (lookupsids fails
+# the whole batch with NT_STATUS_INVALID_SID), so they keep the raw SID as
+# their name, as smbcacls shows them.
+_UNRESOLVABLE_SID_PREFIX = "S-1-22-"
+
+_LOOKUPSIDS_LINE = re.compile(r"^(S-\d+(?:-\d+)+) (.*) \((\d+)\)$")
+
+_sid_cache: dict[tuple[str, str], tuple[str, int]] = {}  # (server, sid) -> (name, type)
+_sid_cache_lock = threading.Lock()
 
 _acl_cache: dict[tuple, list[str]] = {}
 _acl_cache_lock = threading.Lock()
@@ -54,35 +75,117 @@ class AclLookupProblem(Exception):
     retroactively lock everyone out of content because of a transient error)."""
 
 
-def _query_acl_raising(share: dict, smb_path: str) -> list[str]:
+def _auth_args(share: dict) -> list[str]:
     user, password, domain = smb_shares.credentials(share)
-    target = f"//{share['server']}/{share['share']}"
     auth = f"{domain}\\{user}%{password}" if domain else f"{user}%{password}"
+    # A share with `encrypt: true` gets its ACL lookups encrypted too.
+    protection = ["--client-protection=encrypt"] if share.get("encrypt") else []
+    return ["-U", auth, *protection]
 
+
+def _run_lookupsids(share: dict, sids: list[str]) -> subprocess.CompletedProcess:
     try:
-        # A share with `encrypt: true` gets its ACL lookups encrypted too.
-        protection = ["--client-protection=encrypt"] if share.get("encrypt") else []
+        return subprocess.run(
+            ["rpcclient", f"//{share['server']}", *_auth_args(share), "-c", "lookupsids " + " ".join(sids)],
+            capture_output=True, text=True, timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        # Not {exc}: its text is the whole command line, password included.
+        raise AclLookupProblem(f"rpcclient lookupsids on {share['server']} timed out") from None
+
+
+def _parse_lookupsids(stdout: str) -> dict[str, tuple[str, int]]:
+    found: dict[str, tuple[str, int]] = {}
+    for line in stdout.splitlines():
+        match = _LOOKUPSIDS_LINE.match(line.strip())
+        if not match:
+            continue
+        sid, qualified, sid_type = match.group(1), match.group(2), int(match.group(3))
+        name = qualified.split("\\")[-1]
+        if not name or name == "*unknown*":
+            name = sid
+        found[sid] = (name, sid_type)
+    return found
+
+
+def _resolve_sids(share: dict, sids: list[str]) -> dict[str, tuple[str, int]]:
+    """(name, SID type) for each SID, asking the file server for the ones not
+    already cached. RAISES AclLookupProblem when the server can't be asked at
+    all: guessing would turn users into groups (or the reverse)."""
+    server = share["server"]
+    resolved: dict[str, tuple[str, int]] = {}
+    missing: list[str] = []
+    for sid in dict.fromkeys(sids):
+        if sid.startswith(_UNRESOLVABLE_SID_PREFIX):
+            resolved[sid] = (sid, 8)
+            continue
+        with _sid_cache_lock:
+            cached = _sid_cache.get((server, sid))
+        if cached is not None:
+            resolved[sid] = cached
+        else:
+            missing.append(sid)
+    if not missing:
+        return resolved
+
+    result = _run_lookupsids(share, missing)
+    found = _parse_lookupsids(result.stdout) if result.returncode == 0 else {}
+    if result.returncode != 0:
+        if "Cannot connect" in (result.stdout + result.stderr):
+            raise AclLookupProblem(f"rpcclient could not connect to {server}: "
+                                   f"{(result.stdout + result.stderr).strip()}")
+        # One bad SID fails the whole batch; ask for each on its own.
+        for sid in missing:
+            one = _run_lookupsids(share, [sid])
+            if one.returncode == 0:
+                found.update(_parse_lookupsids(one.stdout))
+            elif "Cannot connect" in (one.stdout + one.stderr):
+                raise AclLookupProblem(f"rpcclient could not connect to {server}: "
+                                       f"{(one.stdout + one.stderr).strip()}")
+    for sid in missing:
+        entry = found.get(sid, (sid, 8))
+        with _sid_cache_lock:
+            _sid_cache[(server, sid)] = entry
+        resolved[sid] = entry
+    return resolved
+
+
+def _query_acl_raising(share: dict, smb_path: str) -> list[str]:
+    target = f"//{share['server']}/{share['share']}"
+    try:
         result = subprocess.run(
-            ["smbcacls", target, smb_path, "-U", auth, *protection],
+            ["smbcacls", "--numeric", target, smb_path, *_auth_args(share)],
             capture_output=True, text=True, check=True, timeout=15,
         )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        raise AclLookupProblem(f"smbcacls failed for {smb_path}: {exc}") from None
+    # Not {exc} in these messages: its text is the whole command line, password included.
+    except subprocess.TimeoutExpired:
+        raise AclLookupProblem(f"smbcacls timed out for {smb_path}") from None
+    except subprocess.CalledProcessError as exc:
+        detail = " ".join((exc.stdout or exc.stderr or "").split())[:200]
+        raise AclLookupProblem(f"smbcacls failed for {smb_path} (exit {exc.returncode}): {detail}") from None
 
-    found: list[str] = []
+    # --numeric lines look like ACL:<SID>:<type>/<flags>/<mask>
+    granted: list[str] = []
     for line in result.stdout.splitlines():
         line = line.strip()
         if not line.startswith("ACL:"):
             continue
-        body = line[len("ACL:"):]
-        principal = body.split(":", 1)[0]
-        perm_part = body.split(":", 1)[1] if ":" in body else ""
-        if perm_part.startswith("DENIED"):
+        sid, _, perm_part = line[len("ACL:"):].partition(":")
+        if perm_part.split("/", 1)[0] in _DENIED_ACE_TYPES:
             continue
+        granted.append(sid)
 
-        name = principal.split("\\")[-1]
+    names = _resolve_sids(share, [sid for sid in granted if sid not in _EVERYONE_SIDS])
+    found: list[str] = []
+    for sid in granted:
+        if sid in _EVERYONE_SIDS:
+            found.append(role_store.EVERYONE)
+            continue
+        name, sid_type = names[sid]
         if name.upper() in _EVERYONE_PRINCIPALS:
             found.append(role_store.EVERYONE)
+        elif sid_type == _SID_TYPE_USER:
+            found.append(role_store.user_role(name))
         else:
             found.append(role_store.group_role(name))
 
