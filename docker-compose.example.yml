@@ -109,7 +109,7 @@ services:
   # the CPU; to use an NVIDIA GPU, add docker-compose.gpu.yml (see there).
   # Downloads the model on first start into the embeddings-cache volume.
   embeddings:
-    image: ${EMBEDDINGS_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}
+    image: ${EMBEDDINGS_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.10.0}
     profiles: [vector]
     environment:
       MODEL_ID: ${EMBEDDINGS_MODEL:-BAAI/bge-base-en-v1.5}
