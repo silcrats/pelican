@@ -19,7 +19,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 COPY pelican ./pelican
-COPY crawl_smb.py crawl_exchange.py crawl_sharepoint.py sync_smb_acl.py ./
+COPY crawl_smb.py crawl_exchange.py crawl_sharepoint.py sync_smb_acl.py \
+     run_worker.py check_source.py purge_source.py rebuild_index.py ./
 COPY search_index_mapping.json ./
 # Defaults baked in; mount over /app/config (or individual files, or point
 # PELICAN_CONFIG / SHARES_CONFIG / EXCHANGE_CONFIG / SHAREPOINT_CONFIG
@@ -30,10 +31,17 @@ COPY config ./config
 # readable (state and status: writable) by UID 10001. /state and /status
 # are created here so new named volumes come up owned by it.
 RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin pelican \
-    && mkdir -p /state /status && chown pelican:pelican /state /status
+    && mkdir -p /state/smb /state/exchange /state/sharepoint /status \
+    && chown -R pelican:pelican /state /status
+# Shown in the admin portal's list of workers. Set by the publish workflow.
+ARG VERSION=dev
+ARG REVISION=
+RUN printf '%s\n%s\n' "$VERSION" "$REVISION" > /app/version
 USER pelican
 
 # One-shot run: crawls once and exits; schedule it externally (e.g. ofelia).
 # Pick the job per container with an entrypoint override:
 #   python -u crawl_smb.py | crawl_exchange.py | crawl_sharepoint.py | sync_smb_acl.py
+# or run_worker.py: a long-running worker that takes its jobs from the
+# admin portal instead.
 ENTRYPOINT ["python", "-u", "crawl_smb.py"]

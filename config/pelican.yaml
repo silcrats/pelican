@@ -96,7 +96,7 @@ vector:
 state:
   db_path: "${STATE_DB_PATH:-/state/pelican_state.db}"
 
-# Progress files read by the status page (status-page/).
+# Progress files, read by admin portal workers for running totals.
 status:
   dir: "${STATUS_DIR:-/status}"
   job_name: "${JOB_NAME:-primary}"

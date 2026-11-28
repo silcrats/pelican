@@ -530,7 +530,7 @@ def run() -> None:
     print(f"Total indexed across all sites: {grand_total}")
     status.job_finished()
     # Non-zero exit so the scheduler and monitoring see the failure; the
-    # status page shows which site and why.
+    # log shows which site and why.
     failed = status.failed_sources()
     if failed:
         sys.exit(f"{len(failed)} site(s) failed: {', '.join(failed)}")

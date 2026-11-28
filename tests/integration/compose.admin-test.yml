@@ -1,0 +1,15 @@
+# Overlay for the integration test's admin portal phase, on top of
+# docker-compose.admin.yml: its own port and name, and the test's
+# shares.yaml to import.
+services:
+  admin:
+    container_name: pelican-itest-admin
+    ports: !override
+      - "18091:8091"
+    volumes:
+      - ./tests/integration:/import:ro
+
+  worker:
+    environment:
+      WORKER_POLL_SECONDS: "2"
+      WORKER_NAME: itest-worker

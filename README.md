@@ -34,7 +34,8 @@ search UI built for it.
 - **Fail-closed access**: if permissions can't be read, new content is
   restricted and existing content keeps its last known access.
 - **Built for unattended runs**: one-shot jobs, a process watchdog for silent
-  network hangs, and a status page showing every job and index growth.
+  network hangs, and an [admin portal](#admin-portal) showing every job and
+  index growth.
 
 ## Quick start
 
@@ -47,19 +48,22 @@ docker compose -f docker-compose.example.yml up -d
 ```
 
 This pulls the published images from `ghcr.io/silcrats` (`pelican`,
-`pelican-status`, `pelican-exo-permissions`). Set `PELICAN_VERSION` in `.env`
+`pelican-exo-permissions`, and `pelican-admin` for the portal). Set `PELICAN_VERSION` in `.env`
 to pin a release, or add `--build` to build from your checkout instead.
 
 The example runs a single-node OpenSearch with its security plugin on (see
 [OpenSearch security](#opensearch-security)), one container per job
-scheduled by [ofelia](https://github.com/mcuadros/ofelia), and the status
-page on <http://localhost:8090> (sign in as `pelican` with `STATUS_PASSWORD`).
-Remove the services you don't need.
+scheduled by [ofelia](https://github.com/mcuadros/ofelia). Remove the
+services you don't need. To see jobs and storage in a browser, add the
+[admin portal](#admin-portal).
 
 Each crawler is a one-shot process: it crawls once and exits. If any share,
 mailbox or site fails, it still crawls the rest, then exits with status 1
-and lists the failures (the status page shows why). The image defaults to
+and lists the failures (its log shows why). The image defaults to
 `crawl_smb.py`; choose another job with an entrypoint override.
+
+With the [admin portal](#admin-portal), workers run these jobs on each
+source's schedule instead, and the sources live in the portal.
 
 | Job | Purpose | Config |
 | --- | --- | --- |
@@ -68,7 +72,6 @@ and lists the failures (the status page shows why). The image defaults to
 | `crawl_exchange.py` | Exchange Online mailboxes → index | `config/exchange.yaml` |
 | `crawl_sharepoint.py` | SharePoint Online sites → index | `config/sharepoint.yaml` |
 | `exo-permissions/` | Export mailbox Full Access holders (PowerShell) | `config/exchange.yaml` |
-| `status-page/` | Always-on status page | -- |
 
 The comments at the top of each config file cover the Entra ID / Exchange /
 SharePoint permissions each job needs. Every Graph permission is read-only.
@@ -93,11 +96,9 @@ that hold them (`user_env` / `pass_env` / `domain_env` for SMB,
 | `OS_USERNAME`, `OS_PASSWORD` | none | OpenSearch sign-in, for a cluster with the security plugin |
 | `OS_CA_CERTS` | system CAs | CA certificate file that signed OpenSearch's certificate |
 | `STATE_DB_PATH` | `/state/pelican_state.db` | Incremental state. One volume per crawler; an SMB crawler and its ACL sync share one |
-| `JOB_NAME`, `STATUS_DIR` | `primary`, `/status` | Status file name and location |
+| `JOB_NAME`, `STATUS_DIR` | `primary`, `/status` | Progress file name and location (the portal's worker reads it for running totals) |
 | `SHARE_NAMES`, `MAILBOX_NAMES`, `SITE_NAMES` | all | Comma-separated subset for this container, to split work across containers |
 | `TZ` | UTC | Time zone for status timestamps |
-| `STATUS_PASSWORD`, `STATUS_USERNAME` | required, `pelican` | Status page sign-in (a sign-in page for browsers; scripts can send them as HTTP Basic). It won't start without a password of 12+ characters |
-| `STATUS_SECURE_COOKIE` | off | Set to `true` when the status page is served over HTTPS (e.g. behind a reverse proxy), so its session cookie is never sent over plain HTTP |
 
 Tuning (all optional): `BATCH_SIZE`, `SMB_WORKERS`, `GRAPH_WORKERS`,
 `SP_WORKERS`, `ACL_SYNC_WORKERS`, `ACL_RECHECK_HOURS`, `PDF_TIMEOUT_SECONDS`,
@@ -117,6 +118,113 @@ In the compose example, ofelia doesn't get the Docker socket: it goes through
 ones ([ofelia/docker-api-proxy.cfg](ofelia/docker-api-proxy.cfg)). With the
 socket itself, anyone who took over ofelia would control the host. Third-party
 images are pinned to exact versions; Dependabot proposes updates.
+
+## Admin portal
+
+Optional. Instead of editing `config/*.yaml` and the compose file to add a
+share, mailbox or site, people manage sources in a web portal, and you can
+hand parts of that to other teams without giving them the YAML, the server
+or the crawl account.
+
+```sh
+# in .env: WORKER_TOKEN, and LDAP_* with SUPER_ADMIN_GROUPS (see .env.example)
+docker compose -f docker-compose.example.yml -f docker-compose.admin.yml up -d
+```
+
+The portal is on <http://localhost:8091>. On first start it imports the
+sources and settings in `config/shares.yaml`, `exchange.yaml` and
+`sharepoint.yaml`; after that the portal is where they live (changes to the
+files are ignored). Leaving out `docker-compose.admin.yml` goes back to the
+YAML files and ofelia.
+
+**What it does**
+
+- **Sources**: add, edit, disable or remove SMB shares, Exchange mailboxes
+  and SharePoint sites; *Test connection* signs in as the crawler would and
+  reads a little, without indexing. A source's name and location (server,
+  share and folder; mailbox; site URL) are fixed once it's created, since
+  every document carries them: add a new source and remove the old one
+  instead.
+- **Removing a source** shows how many documents it has, asks for its name,
+  then deletes its documents from the index and its crawl state. *Disable*
+  stops crawling but leaves the documents searchable.
+- **Schedules**: each source has its own crawl interval (and, for SMB, a
+  permission sync interval), or manual only; *Crawl now* queues one.
+- **Delegation** with *scopes*: a super admin creates a scope, names the AD
+  groups that manage it, and sets its limits: which source types, which SMB
+  servers and crawl accounts, which extra access its mail and SharePoint
+  sources may grant, and the shortest schedule. Members of those groups see
+  and manage only that scope's sources. A scope can't send the crawl
+  account's credentials to a server you didn't list, or make documents
+  visible to people you didn't allow (Microsoft 365 group overrides are
+  super-admin only).
+- **Audit log** of every change, with the before and after; scoped admins
+  see their scopes' entries.
+- **Activity**: queued, running and recent jobs with their output and
+  running totals, and the workers' last check-in.
+- **Storage**: index size, disk, growth, and each source's documents and
+  estimated share of the index, read with the `pelican-status` account and
+  refreshed every 15 minutes (`STORAGE_REFRESH_SECONDS`). Growth history is
+  kept in `admin-data`. Scoped admins see only their own sources' rows.
+- **Access**: what one person can see in search. Enter a username to see
+  their groups, the roles Frogmouth gives them at sign-in, and for each
+  source how many documents those roles open and through which role. It
+  also flags disabled accounts and groups reached only through another
+  group, which search doesn't count. It needs a directory account to read
+  other people's groups (`LDAP_LOOKUP_USER`, `LDAP_LOOKUP_PASSWORD`; any
+  ordinary domain account will do) and counts with the `pelican-status`
+  account. Scoped admins see only their own sources' rows; each check is
+  in the audit log. If Frogmouth's `security` prefixes or default roles
+  aren't the defaults, set `ROLE_PREFIX_*` and `DEFAULT_ROLES` to match.
+- **Index** (super admins): which index search uses, and its vector
+  search settings: on or off, the embeddings server and model, and the
+  passage size. *Rebuild* builds a new index from the documents already in
+  the live one (nothing is crawled again), embedding each with the saved
+  settings, then switches search to it once it's complete and checked; the
+  previous index is kept so you can switch back until the next crawl
+  writes to the new one. *Check server* tests an embeddings server first.
+  Crawls, ACL syncs and removals wait while a rebuild or switch runs.
+  Needs the `pelican-maintainer` account (`OS_MAINT_PASSWORD` in `.env`,
+  then re-run `opensearch-users`); see [Vector search](#vector-search).
+
+**How it fits together**
+
+- `admin` (image `pelican-admin`) holds the sources, scopes and schedules in
+  SQLite on the `admin-data` volume. It has no SMB, Graph or OpenSearch
+  write credentials: sources name the environment variables that hold
+  them, as the YAML does. Credential profiles (Credentials page) map a name
+  to `user_env` / `pass_env` / `domain_env`; set those variables on every
+  worker.
+- `worker` (the `pelican` image, `run_worker.py`) asks the portal for due
+  jobs with `WORKER_TOKEN` and runs the usual one-shot scripts, each with a
+  YAML file holding only its source. It replaces the per-job containers and
+  ofelia's crawl jobs, and reuses their state volumes, so nothing is
+  re-crawled. To crawl more at once, allow more jobs per worker on the
+  Activity page (2 by default; super admins set the default and can give a
+  worker its own number, up to 16), or add workers with `--scale worker=N`.
+  Workers on other hosts (with `ADMIN_URL` pointing at the portal) work, but
+  each host keeps its own crawl state, so a source whose jobs move between
+  hosts is crawled again from scratch. A job whose worker stops checking in for two
+  minutes is marked failed and runs again on schedule. Workers show on the
+  Activity page under their Compose name (`pelican-worker-1`, `-2`, ...);
+  set `WORKER_NAME` for one elsewhere, different for each worker. One not
+  heard from for an hour leaves the list.
+- The portal writes `shares.yaml`, `exchange.yaml` and `sharepoint.yaml`
+  with every source to the `admin-export` volume. The mailbox permission
+  export reads `exchange.yaml` from there, and Frogmouth can mount it for
+  its SMB downloads (`downloads.smb.shares_file`).
+- Sign-in is against AD (`LDAP_URL`, `LDAP_BIND_TEMPLATE`, `LDAP_BASE_DN`;
+  `ldaps://` or `LDAP_START_TLS=true`, with `LDAP_CA_FILE` for a private
+  CA). Members of `SUPER_ADMIN_GROUPS` are super admins; anyone else signs in only
+  if a scope names one of their groups. `ADMIN_BREAKGLASS_PASSWORD` adds a
+  local super admin, `pelican-admin`, for first setup or a directory outage.
+  The page is plain HTTP: put it behind an HTTPS reverse proxy and set
+  `ADMIN_SECURE_COOKIE=true`.
+- The *Settings* page edits each type's global settings (everything in its
+  YAML file except the source list) as YAML, super admins only.
+
+Not managed in the portal: `config/pelican.yaml`, OpenSearch, and the
+Exchange permission export's own schedule (ofelia keeps that one job).
 
 ## OpenSearch security
 
@@ -142,7 +250,7 @@ The compose example sets this up:
   | Account | Password in `.env` | Can |
   | --- | --- | --- |
   | `pelican` | `OS_PASSWORD` | create the index, write, update and delete documents. Not delete the index |
-  | `pelican-status` | `OS_STATUS_PASSWORD` | search, index and disk stats |
+  | `pelican-status` | `OS_STATUS_PASSWORD` (needed by the admin portal) | search, index and disk stats. For the portal's Storage page |
   | `pelican-reader` | `OS_READER_PASSWORD` (optional) | search. For Frogmouth or another UI |
   | `admin` | `OS_ADMIN_PASSWORD` (optional) | everything. For you |
 
@@ -225,13 +333,41 @@ model). On first start it waits up to 15 minutes while the service
 downloads the model. Each run replaces the model and its connector with
 fresh ones.
 
+**With the admin portal** you can instead turn vectors on or off, or move
+to another model or passage size, on its *Index* page, on an index that
+already exists. That needs `COMPOSE_PROFILES=vector`, `EMBEDDINGS_API_KEY`
+and `OS_MAINT_PASSWORD` in `.env` (not `VECTOR_ENABLED`), then
+`docker compose ... up -d opensearch-users` to create the
+`pelican-maintainer` account. A rebuild:
+
+1. waits for running crawls, and holds new ones until it's done;
+2. the first time, keeps the index as `documents-1` (a clone, which takes
+   almost no extra space) so that `documents` can become an alias;
+3. registers a model and pipelines of its own (`pelican-embed-<n>`,
+   `pelican-search-<n>`), and creates `documents-<n>` with them;
+4. copies every document into it, re-embedding each (hours on a large
+   index; the progress shows on the page);
+5. checks the copy has every document, then points `documents` at it in one
+   step, so searches never see a half-built index;
+6. keeps the index it replaced as the previous one, and deletes any older
+   one with the model and pipelines only that used.
+
+Search keeps using the old index throughout, so a failed or cancelled
+rebuild changes nothing. The disk needs room for one more copy of the index
+while it runs. To use a different model, run a second embeddings service
+with it (another service like `embeddings` in your compose file, with its own
+`--model-id`), point the portal at its address, and rebuild; once the old
+index is deleted the first service can go. Once the index has been rebuilt
+from the portal, `opensearch-users` leaves its vectors to the portal.
+
 Things to know:
 
-- **New index only.** The index is created with the vector fields and
-  pipelines; an existing index keeps its mapping, and crawlers log a warning
-  if vector search is on but the index has none. To add vectors, delete the
-  index and the crawlers' state volumes, then crawl again. Changing the
-  model or `dimension` needs the same.
+- **New index only, without the portal.** The index is created with the
+  vector fields and pipelines; an existing index keeps its mapping, and
+  crawlers log a warning if vector search is on but the index has none. To
+  add vectors without the portal, delete the index and the crawlers' state
+  volumes, then crawl again. Changing the model or `dimension` needs the
+  same.
 - **Only the start of long documents is embedded:** up to `max_chunks`
   passages (100 by default, about 30,000 words). All of the text stays
   searchable by keyword.
@@ -268,7 +404,7 @@ Any search UI reading the index must agree with `config/pelican.yaml`:
   `sharepoint-online`; `share` is the share, mailbox or site name.
 - **Index.** `opensearch.index`, created with `search_index_mapping.json` on
   first run.
-- **Vectors** (only with vector search on). `content_embedding` is a nested
+- **Vectors** (only with vector search on). `content_embedding_mean` is one vector for the whole document, the average of its passages. `content_embedding` is a nested
   field with one `{"knn": [...]}` object per passage of `content`; the
   index's default search pipeline fills in the model for `neural` queries
   and blends `hybrid` query scores.
@@ -280,6 +416,9 @@ Changing prefixes or `host` values on an existing index needs a full re-crawl.
 ```
 crawl_smb.py, sync_smb_acl.py,     job entry points
 crawl_exchange.py, crawl_sharepoint.py
+check_source.py, purge_source.py   connection test, source removal
+rebuild_index.py                   index rebuilds and switches (portal's Index page)
+run_worker.py                      worker for the admin portal
 pelican/                           shared core
   settings.py                      config loading
   index.py                         OpenSearch client, schema, bulk writes
@@ -291,14 +430,20 @@ pelican/                           shared core
   status.py, watchdog.py           progress reporting, hang protection
   opensearch_setup.py              certificates, accounts and vector search
                                    setup (compose example)
+  vectors.py                       embedding model, pipelines and index
+                                   settings for vector search
 config/                            example configuration
 search_index_mapping.json          index mapping
 requirements.in                    direct dependencies; requirements.txt is
                                    the pinned, hashed lock (pip-compile)
-status-page/, exo-permissions/     separate images
+exo-permissions/                   separate image
+admin/                             admin portal image (store.py: rules,
+                                   scheduler; admin_server.py: web/API;
+                                   storage.py: storage figures)
 opensearch/                        OpenSearch security config (compose example)
 ofelia/                            Docker API proxy config for the scheduler
 tests/integration/                 end-to-end test (run.sh)
+tests/admin/                       admin portal and worker unit tests
 ```
 
 ## Testing
@@ -311,7 +456,9 @@ VECTOR=1 tests/integration/run.sh     # the same, with vector search on
 builds the images from your checkout and runs the compose example with a
 test Samba server: a real SMB crawl (text, Word and PDF extraction, photo
 EXIF and GPS, ACL roles, exclusions), the ACL sync, every OpenSearch account's permissions,
-the status page sign-in, snapshots and the scheduler proxy. It uses its
+snapshots, the scheduler proxy, and the admin portal with a worker (import,
+test connection, crawl, adding a source and removing it with its documents,
+storage figures). It uses its
 own project name, volumes and ports, so it can run next to a real
 deployment. With `VECTOR=1` it also starts the CPU embeddings service
 (downloading the model, about 450 MB, each run) and checks that every
@@ -319,6 +466,13 @@ fixture is embedded, that a role-filtered neural query as `pelican-reader`
 finds exactly what those roles allow, and that a role change doesn't
 re-embed anything. GitHub Actions runs it before building any image, including
 on Dependabot's pull requests.
+
+The admin portal's rules (delegation limits, scheduling, removal) and the
+worker have unit tests that need only Python, pyyaml, ldap3 and requests:
+
+```sh
+python -m unittest discover -s tests/admin
+```
 
 ## AI disclosure
 

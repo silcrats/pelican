@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pelican Admin</title>
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<div id="signin" class="signin" hidden>
+  <form id="signin-form" class="signin-card" autocomplete="on">
+    <h1>Pelican Admin</h1>
+    <p class="muted">Sign in with your directory account.</p>
+    <label>Username<input name="username" autocomplete="username" required autofocus></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+    <p id="signin-error" class="error" role="alert" hidden></p>
+    <button type="submit" class="primary">Sign in</button>
+  </form>
+</div>
+
+<div id="app" hidden>
+  <header class="topbar">
+    <a class="brand" href="#/sources">Pelican <span>Admin</span></a>
+    <nav id="nav" aria-label="Sections"></nav>
+    <div class="who">
+      <span id="who-name"></span>
+      <button id="signout" class="link">Sign out</button>
+    </div>
+  </header>
+  <main id="main" tabindex="-1"></main>
+  <footer class="foot"><span id="version"></span></footer>
+</div>
+<div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

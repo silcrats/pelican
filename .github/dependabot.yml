@@ -4,13 +4,13 @@
 version: 2
 updates:
   - package-ecosystem: pip
-    directory: /
+    directories: [/, /admin]
     schedule: { interval: weekly }
     groups:
       pip: { patterns: ["*"], update-types: [minor, patch] }
 
   - package-ecosystem: docker
-    directories: [/, /status-page, /exo-permissions]
+    directories: [/, /admin, /exo-permissions]
     schedule: { interval: weekly }
     ignore:
       - dependency-name: python
